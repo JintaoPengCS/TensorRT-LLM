@@ -798,8 +798,7 @@ struct WarpSpecializedLayerNorm
         shared->init(threadIdx.x == 0);
 
         __syncthreads();
-#if (defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 12))
-#if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL))
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12)
         if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
         {
             auto block_id = blockIdx.x;
@@ -827,7 +826,6 @@ struct WarpSpecializedLayerNorm
                 compute(block_id, threadIdx.x / 128 - 1, tid_in_wg, param, shared);
             }
         }
-#endif
 #endif
     }
 };
