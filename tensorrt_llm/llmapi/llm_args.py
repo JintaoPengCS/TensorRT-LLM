@@ -1934,6 +1934,36 @@ class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         description=
         "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB."
     )
+    policy: Optional[Literal["adaptive"]] = Field(
+        default=None,
+        description=
+        "Placement policy. None (the default) is the standard EPLB above. `adaptive` is GenEPLB: `num_slots` counts the active slots (every expert once plus its replicas), each rank also keeps spare landing slots, replicas are copied GPU to GPU when the predicted saving pays for the copy, and each replica's traffic share is re-solved from the measured load. `layer_updates_per_iter` and `initial_global_assignments` must stay unset.",
+        status="prototype")
+    cost_model_b: Optional[Dict[Literal["source"], Literal["prior"]]] = Field(
+        default=None,
+        description=
+        "GenEPLB B: `{source: prior}` prices the traffic shares and the installs with the measured MegaMoE cost model instead of balancing rows. Requires `policy: adaptive`.",
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> "MoeLoadBalancerConfig":
+        if self.cost_model_b is not None and self.policy != "adaptive":
+            raise ValueError(
+                "moe_config.load_balancer.cost_model_b requires policy: adaptive"
+            )
+        if self.policy == "adaptive":
+            if self.num_slots is None:
+                raise ValueError(
+                    "moe_config.load_balancer.policy adaptive needs num_slots "
+                    "(active expert slots: every expert once plus its replicas)"
+                )
+            if (self.layer_updates_per_iter != 0
+                    or self.initial_global_assignments is not None):
+                raise ValueError(
+                    "moe_config.load_balancer.policy adaptive decides the "
+                    "placement at run time: leave layer_updates_per_iter and "
+                    "initial_global_assignments unset")
+        return self
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:

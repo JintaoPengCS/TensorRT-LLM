@@ -4153,6 +4153,27 @@
       "additionalProperties": false,
       "description": "Configure the standard asynchronous EPLB implementation.",
       "properties": {
+        "cost_model_b": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "const": "prior",
+                "type": "string"
+              },
+              "propertyNames": {
+                "const": "source"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "GenEPLB B: `{source: prior}` prices the traffic shares and the installs with the measured MegaMoE cost model instead of balancing rows. Requires `policy: adaptive`.",
+          "status": "prototype",
+          "title": "Cost Model B"
+        },
         "initial_global_assignments": {
           "anyOf": [
             {
@@ -4198,6 +4219,21 @@
           "default": null,
           "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots.",
           "title": "Num Slots"
+        },
+        "policy": {
+          "anyOf": [
+            {
+              "const": "adaptive",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Placement policy. None (the default) is the standard EPLB above. `adaptive` is GenEPLB: `num_slots` counts the active slots (every expert once plus its replicas), each rank also keeps spare landing slots, replicas are copied GPU to GPU when the predicted saving pays for the copy, and each replica's traffic share is re-solved from the measured load. `layer_updates_per_iter` and `initial_global_assignments` must stay unset.",
+          "status": "prototype",
+          "title": "Policy"
         }
       },
       "title": "MoeLoadBalancerConfig",

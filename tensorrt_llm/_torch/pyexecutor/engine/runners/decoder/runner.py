@@ -752,6 +752,11 @@ class DecoderRunner(ScheduledModelRunner):
             ):
                 self._inputs._apply_device_window_prologue(inputs, new_tensors_device)
 
+            # GenEPLB reads the step's real decode rows and request budgets.
+            begin_step = getattr(moe_load_balancer, "begin_step", None)
+            if begin_step is not None:
+                begin_step(scheduled_requests, runtime_draft_len, can_run_graph, is_dummy)
+
             def run_model(model_inputs: dict[str, Any]) -> Any:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     return self._forward_step(

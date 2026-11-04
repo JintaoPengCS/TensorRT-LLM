@@ -1152,6 +1152,16 @@ def maybe_create_moe_load_balancer(
                 config.num_slots,
                 getattr(config, "auxiliary_sms", 4),
             )
+        elif mode == "standard" and getattr(config, "policy",
+                                            None) == "adaptive":
+            from .geneplb import GenEplbMoeLoadBalancer
+
+            moe_load_balancer = GenEplbMoeLoadBalancer(ep_rank=ep_rank,
+                                                       ep_size=ep_size,
+                                                       config=config,
+                                                       mapping=mapping)
+            logger.info("Created GenEPLB adaptive MoE LoadBalancer, %r",
+                        moe_load_balancer)
         elif mode == "standard":
             if config.layer_updates_per_iter > 0:
                 # TODO: remove this when supported.
