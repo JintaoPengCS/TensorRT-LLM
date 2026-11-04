@@ -1110,6 +1110,14 @@
       "path": "moe_config.load_balancer.num_slots"
     },
     {
+      "allowed_values": [
+        "adaptive"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.policy"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_config.max_num_tokens"

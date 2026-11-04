@@ -553,8 +553,22 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         # axis H=E/EP; only the live kernel planes are widened to M=P/EP.
         per_layer_dynamic_eplb = (getattr(moe_load_balancer_config, "mode",
                                           None) == "per_layer_dynamic")
+        # GenEPLB (policy adaptive): num_slots counts active slots; every rank
+        # holds its homes plus spare landing slots. A layer it does not balance
+        # keeps the plain expert partition.
+        adaptive_eplb = getattr(moe_load_balancer_config, "policy",
+                                None) == "adaptive"
+        if adaptive_eplb and moe_load_balancer is not None and not moe_load_balancer.balances(
+                self, model_config):
+            moe_load_balancer = moe_load_balancer_config = None
         if moe_load_balancer_config and not per_layer_dynamic_eplb:
-            init_expert_size_per_partition = moe_load_balancer_config.num_local_slots
+            if adaptive_eplb:
+                from .geneplb.geometry import local_slot_count
+                init_expert_size_per_partition = local_slot_count(
+                    self.num_experts, self.ep_size,
+                    moe_load_balancer_config.num_slots)
+            else:
+                init_expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.initial_global_assignments = [
                 (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
                 self.num_experts for ep_rank in range(self.ep_size)
@@ -593,7 +607,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                         f"({self.ep_size}) so resident H is rank-identical.")
                 self.expert_size_per_partition = self.num_experts // self.ep_size
             else:
-                self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+                self.expert_size_per_partition = init_expert_size_per_partition
 
             # Add this layer to the load balancer. slot_count_per_rank is the
             # compute capacity M for per-layer dynamic mode and the ordinary local
@@ -619,7 +633,11 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             )
             loaded_initial_global_assignments = (get_initial_assignments(
                 self.layer_idx) if callable(get_initial_assignments) else None)
-            self.num_slots = moe_load_balancer_config.num_slots
+            if adaptive_eplb:
+                self.num_slots = self.ep_size * self.expert_size_per_partition
+                self.layer_load_balancer.bind_moe(self)
+            else:
+                self.num_slots = moe_load_balancer_config.num_slots
 
             if loaded_initial_global_assignments is not None:
                 assert isinstance(loaded_initial_global_assignments, list)
