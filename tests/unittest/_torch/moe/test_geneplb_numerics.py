@@ -656,6 +656,43 @@ def test_route_kernel_matches_reference(variant, tmp_path):
                     assert got.view(-1).tolist() == want
 
 
+def test_route_stage_matches_route_and_staging(tmp_path):
+    """B's stage entry == its route + MegaMoE's staging: slots then -1, weights then 0, other columns untouched."""
+    torch, native = _cuda()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    _, _, phys, _ = golden_case(3)
+    rng = _Rng(37)
+    tabs = shares.tables_from_phys(phys, E)
+    cw = shares.cumw_from_weights(np.array([rng.uniform() for _ in range(S)]), phys, tabs)
+    lt = _tables(torch, dev, tabs, cw, 1)
+    kern = native.RouteKernel("B", E, S, R, 5, dev, cache_dir=tmp_path)
+    for rows, bucket, word in (
+        (0, 256, None),
+        (1, 256, None),
+        (171, 256, 168),
+        (256, 256, None),
+        (300, 1024, 297),
+    ):
+        ids = torch.randint(0, E, (rows, 6), dtype=torch.int32, device=dev)
+        if rows:
+            ids[0, 0] = -1
+        w_in = torch.rand(rows, 6, dtype=torch.float32, device=dev)
+        vr = torch.tensor(
+            [native.VALID_ALL if word is None else word], dtype=torch.int32, device=dev
+        )
+        for dtype in (torch.int64, torch.int32):
+            idx = torch.full(
+                (bucket, 6), 7, dtype=dtype, device=dev
+            )  # stale rows of an earlier launch
+            w_out = torch.full((bucket, 8), 5.0, device=dev)
+            kern.stage(ids, lt, max(rows, 1), vr, idx, w_in, w_out)
+            if rows:
+                assert torch.equal(idx[:rows], kern(ids, lt, rows, vr, dtype))
+            assert bool((idx[rows:] == -1).all())
+            assert torch.equal(w_out[:rows, :6], w_in) and bool((w_out[rows:, :6] == 0).all())
+            assert bool((w_out[:, 6:] == 5.0).all())
+
+
 def test_route_kernel_capturable(tmp_path):
     torch, native = _cuda()
     dev = torch.device("cuda", torch.cuda.current_device())

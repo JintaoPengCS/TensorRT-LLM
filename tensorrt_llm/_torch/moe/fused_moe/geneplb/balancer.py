@@ -14,6 +14,7 @@ published once every rank's copies have landed.
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any, Optional
 
@@ -190,6 +191,15 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         )  # as the shipped arms (B's int64 cut)
         self._rows_ref = None
         self._held = {}
+        # B's stage cut: a MegaMoE layer routes inside its run_moe, straight into the launch bucket's staging
+        # (after its input is quantized there), instead of a route launch plus four staging fills / copies.
+        self.staged = set()
+        if self.mode == "B":
+            for layer in self.layers:
+                backend = getattr(layer.moe, "backend", None)
+                if hasattr(backend, "_route_stager"):
+                    backend._route_stager = functools.partial(self._stage, layer)
+                    self.staged.add(layer.index)
         self.slot_tensors = [self._slot_tensors(layer) for layer in self.layers]
         self.b_layers = {
             li.index: self.mode == "B" for li in self.layers
@@ -200,7 +210,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             names = ",".join(n for n, _ in self.slot_tensors[0])
             logger.info(
                 f"GenEPLB ready: mode {self.mode}, {L} layers, E {geo.experts}, EP {geo.ranks}, "
-                f"{geo.local_slots} slots/rank ({geo.homes} homes), active {geo.active_slots}, slot planes [{names}]"
+                f"{geo.local_slots} slots/rank ({geo.homes} homes), active {geo.active_slots}, slot planes [{names}], "
+                f"staged {len(self.staged)} layers"
             )
 
     def _slot_tensors(self, layer: GenEplbLayer) -> list:
@@ -350,8 +361,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         """Map the layer's expert ids to slots; inside a CUDA-graph capture also record the statistics: every
         layer's ids are held and ONE fused count kernel over all layers is captured after the last layer (the
         shipped 'fused_ptr' mode). Eager steps count nothing."""
+        staged = layer.index in self.staged
         if ids.numel() == 0:
-            return ids.to(self.out_dtype)
+            return ids if staged else ids.to(self.out_dtype)
         if layer.index == 0 or self._rows_ref is None:
             self._rows_ref = int(
                 ids.shape[0]
@@ -369,8 +381,21 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                     self.enable,
                 )
                 self._held = {}  # the launch is recorded; stream order protects the reads
+        if staged:
+            return ids  # expert ids: the backend's run_moe routes them into its staging (_stage)
         return self.kernel(
             ids, self._tables(layer.index), self._rows_ref, self.valid_rows, self.out_dtype
+        )
+
+    def _stage(self, layer: GenEplbLayer, ids, weights, idx_out, w_out) -> None:
+        self.kernel.stage(
+            ids,
+            self._tables(layer.index),
+            self._rows_ref or 1,
+            self.valid_rows,
+            idx_out,
+            weights,
+            w_out,
         )
 
     def _tables(self, li: int):
