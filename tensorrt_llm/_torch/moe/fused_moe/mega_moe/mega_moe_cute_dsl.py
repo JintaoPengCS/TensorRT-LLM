@@ -712,6 +712,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # scalar would reset the wrong buffer when buckets alternate).
         self._local_staging_cache: Dict[Tuple, Dict[str, torch.Tensor]] = {}
         self._last_staged_T: Dict[int, int] = {}
+        # Set by the GenEPLB cost-model-B load balancer only: ``stager(expert_ids, weights,
+        # topk_idx_local, topk_weights)`` routes a launch straight into the bucket's staging
+        # (slots and weights of the routed rows, -1 / 0 past them). The input is then quantized
+        # into the staged activation rows inside run_moe (see ``supports_fused_prepare``).
+        self._route_stager = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -818,6 +823,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # and migrate atomically with the underlying NVFP4 raw weights
         # + scales already handled by the base/grandparent.
         return True
+
+    def supports_fused_prepare(self) -> bool:
+        """With a route stager, run_moe takes the BF16 input and prepares the bucket itself."""
+        return self._route_stager is not None
 
     def validate_configurable_moe(self, moe) -> None:
         """Wrapper-only checks that ``can_implement`` cannot see.
@@ -1144,6 +1153,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         *,
         post_quant_comm: bool = False,
         reserved_sms: int = 0,
+        out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """BF16 -> NVFP4 packed activation + plain K-major FP8 SF.
@@ -1164,6 +1174,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         ``reserved_sms`` is the number of SMs left to the concurrent
         HALO-Q/TMA kernel of a replica plan; zero uses the default
         quantization overload.
+
+        ``out`` (activation, activation_sf staging buffers) quantizes the rows
+        straight into their leading rows when the native in-place overload
+        exists and the scale-factor rows need no pad; the returned tensors
+        are then those rows.
 
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
@@ -1194,11 +1209,23 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             x_bf16 = x_bf16 * fc31_act_scale
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
+        raw_cols = ceil_div(hidden, 16)
         if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
             # Positional: a keyword argument costs the op dispatch about a microsecond.
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
                 x_bf16, self.fc31_input_scale, 16, False, False, reserved_sms
             )
+        elif (
+            out is not None
+            and sf_cols == raw_cols
+            and hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget_out")
+        ):
+            rows = x_bf16.shape[0]
+            x_fp4, x_sf = out[0][:rows], out[1][:rows]
+            torch.ops.trtllm.fp4_quantize.sm_budget_out(
+                x_bf16, self.fc31_input_scale, 16, False, False, 0, out=x_fp4, out_sf=x_sf
+            )
+            return x_fp4, x_sf
         else:
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
                 x_bf16,
@@ -1213,7 +1240,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # (== ``megamoe_activation_sf_bytes_per_row``), so
         # 32-aligned-but-not-64-aligned hidden sizes (1568, 1632, 2080)
         # come back 2 bytes short; pad the tail before returning.
-        raw_cols = ceil_div(hidden, 16)
         x_sf_raw = x_sf.view(x_bf16.shape[0], raw_cols)
         if sf_cols == raw_cols:
             return x_fp4, x_sf_raw
@@ -1279,7 +1305,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
-        if x_sf is None:
+        if x_sf is None and self._route_stager is None:
             raise ValueError("MegaMoECuteDsl requires x_sf from quantize_input")
 
         # Surface a missing multi-rank symm provider BEFORE the weights
@@ -1915,8 +1941,19 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
         )
+        if self._route_stager is not None:
+            # Quantize into the bucket's activation rows, then route the experts
+            # straight into its index / weight rows: no staging copies.
+            if num_tokens > 0:
+                x_fp4, x_sf = self.quantize_input(x, out=(bufs.activation, bufs.activation_sf))
+                if x_fp4.data_ptr() != bufs.activation.data_ptr():
+                    bufs.activation[:num_tokens].copy_(x_fp4.view(torch.uint8), non_blocking=True)
+                    bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+            self._route_stager(topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights)
+            self._last_staged_T[launch_max_T] = num_tokens
         use_direct_inputs = (
-            self.ep_size > 1
+            self._route_stager is None
+            and self.ep_size > 1
             and not self.tactic_autotune
             and num_tokens == launch_max_T
             and launch_max_T in self._genphase_direct_input_buckets
@@ -1938,7 +1975,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
         )
-        if not use_direct_routing_inputs:
+        if not use_direct_routing_inputs and self._route_stager is None:
             self._stage_inputs(
                 bufs=bufs,
                 x=x,

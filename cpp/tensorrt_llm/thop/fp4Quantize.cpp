@@ -42,9 +42,12 @@ namespace torch_ext
 // returns self_fp4, self_block_scale_factors
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self,
+namespace
+{
+// fp4_quantize.sm_budget into new outputs, or into the caller's out / outSf when both are given.
+std::tuple<at::Tensor, at::Tensor> fp4QuantizeSmBudget(at::Tensor const& self,
     std::optional<at::Tensor> const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
-    int64_t reservedSms)
+    int64_t reservedSms, at::Tensor const* out, at::Tensor const* outSf)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -80,13 +83,31 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self
     std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
     outputShape[rank - 1] = k / 2;
 
-    at::Tensor valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
-
     int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)
                                         : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
 
-    at::Tensor scaleFP8SF
-        = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+    at::Tensor valueE2M1;
+    at::Tensor scaleFP8SF;
+    if (out != nullptr && outSf != nullptr)
+    {
+        at::Tensor const& value = *out;
+        at::Tensor const& sf = *outSf;
+        CHECK_TH_CUDA(value);
+        CHECK_CONTIGUOUS(value);
+        CHECK_TH_CUDA(sf);
+        CHECK_CONTIGUOUS(sf);
+        TORCH_CHECK(value.device() == self.device() && sf.device() == self.device(),
+            "out and out_sf must be on the input's device");
+        TORCH_CHECK(value.nbytes() == static_cast<size_t>(m * k / 2), "out must hold exactly m * k / 2 bytes");
+        TORCH_CHECK(sf.nbytes() >= static_cast<size_t>(SFSize), "out_sf is smaller than the scale factors");
+        valueE2M1 = value;
+        scaleFP8SF = sf;
+    }
+    else
+    {
+        valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
+        scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+    }
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     TORCH_CHECK(reservedSms >= 0 && reservedSms < mMultiProcessorCount,
@@ -160,6 +181,23 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 
     return {valueE2M1, scaleFP8SF};
+}
+} // namespace
+
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self,
+    std::optional<at::Tensor> const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
+    int64_t reservedSms)
+{
+    return fp4QuantizeSmBudget(
+        self, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout, reservedSms, nullptr, nullptr);
+}
+
+// fp4_quantize.sm_budget into caller-owned contiguous outputs (out: m * k / 2 bytes, out_sf: at least the scale
+// factors of the requested layout), e.g. rows of a preallocated symmetric staging buffer.
+void fp4_quantize_sm_budget_out(at::Tensor const& self, std::optional<at::Tensor> const& globalScale, int64_t sfVecSize,
+    bool sfUseUE8M0, bool isSfSwizzledLayout, int64_t reservedSms, at::Tensor& out, at::Tensor& outSf)
+{
+    fp4QuantizeSmBudget(self, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout, reservedSms, &out, &outSf);
 }
 
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
@@ -390,6 +428,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_quantize.sm_budget(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True, int reserved_sms=0) -> (Tensor, Tensor)");
+    m.def(
+        "fp4_quantize.sm_budget_out(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
+        "isSfSwizzledLayout=True, int reserved_sms=0, *, Tensor(a!) out, Tensor(b!) out_sf) -> ()");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
     m.def(
         "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "
@@ -401,6 +442,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
     m.impl("fp4_quantize.sm_budget", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_sm_budget));
+    m.impl("fp4_quantize.sm_budget_out", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_sm_budget_out));
     m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
     m.impl("fp4_quantize_with_reorder_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_reorder_residual));
     m.impl("fp4_quantize_with_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_residual));

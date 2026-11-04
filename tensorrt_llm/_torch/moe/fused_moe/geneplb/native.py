@@ -344,6 +344,39 @@ class RouteKernel:
         )
         return out
 
+    def stage(
+        self,
+        ids: torch.Tensor,
+        tables: LayerTables,
+        rows_ref: int,
+        valid_rows: Optional[torch.Tensor],
+        idx_out: torch.Tensor,
+        w_in: torch.Tensor,
+        w_out: torch.Tensor,
+    ) -> None:
+        """B's route written straight into a MegaMoE bucket's staging (the shipped stage cut): idx_out [bucket,
+        top_k] gets the slots of ``ids``' rows and -1 past them, w_out [bucket, >= top_k] (unit column stride)
+        gets ``w_in``'s fp32 weights and 0 past them. Arguments otherwise as ``__call__``."""
+        if self.variant != "B":
+            raise ValueError("GenEPLB route stage is cost model B's")
+        self._check(ids, tables)
+        pad = valid_rows is not None and ids.shape[0] > 0
+        self.ext.route_b_stage(
+            ids,
+            self.ep_rank,
+            tables.expert_count.data_ptr(),
+            tables.expert_start.data_ptr(),
+            tables.slot_ids.data_ptr(),
+            tables.cumw,
+            tables.wmode,
+            int(rows_ref) if pad else int(ids.shape[0]),
+            valid_rows if pad else self._zero,
+            pad,
+            idx_out,
+            w_in,
+            w_out,
+        )
+
 
 class StatsKernel:
     """Per-layer expert counts and their EMA over CUDA-graph replays (the shipped statistics kernel).
