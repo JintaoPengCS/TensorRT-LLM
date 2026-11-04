@@ -213,6 +213,8 @@ package_data += [
     'evaluate/lm_eval_tasks/**/*',
     'schemas/*.json',
     'usage/schemas/*.json',
+    '_torch/moe/fused_moe/geneplb/csrc/*',
+    '_torch/moe/fused_moe/geneplb/data/*.json',
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
