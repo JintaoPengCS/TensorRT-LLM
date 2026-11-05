@@ -1070,6 +1070,10 @@ class ModelEngine:
         """Run model warmup and record its total wall-clock duration."""
         with self.warmup_scope():
             self._warmup_impl(resource_manager)
+        # GenEPLB connects its replica-copy peers once the final KV cache and CUDA graphs are allocated.
+        after_warmup = getattr(self.moe_load_balancer, "after_warmup", None)
+        if after_warmup is not None and self._warmup_timer.purpose != "memory_profiling":
+            after_warmup()
 
     def _warmup_impl(self, resource_manager: ResourceManager | None = None) -> None:
         """
