@@ -55,6 +55,10 @@ LIVE_COOLDOWN = 32
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
 CONNECT_BYTES = 4 << 20
 PROBE_LAYERS = 2
+# The install gate prices copies with the median of the last COPY_HISTORY measured copy times (startup probe
+# included): copy cost is only re-measured by a published install, so a single outlier copy must not price every
+# later install out (a last-value estimate froze installs for good after one 36 ms/layer copy).
+COPY_HISTORY = 9
 
 
 class GenEplbLayer:
@@ -307,6 +311,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.pending_writes = False
         self.renewals = self.install_count = 0
         self.c_gpu_ms = None
+        self.copy_ms_history = []  # measured copy ms/layer (max over ranks), newest last
         self.connected = False
         # No replica held and the last gate admitted none (set by each renewal).
         self.dormant = False
@@ -746,6 +751,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         connect_s, nccl_mb, self.c_gpu_ms = (
             self.comm_done.allreduce(v, op=MPI.MAX) for v in (connect_s, nccl_mb, probe_ms)
         )
+        self.copy_ms_history = [self.c_gpu_ms]
         if r == 0:
             logger.info(
                 f"GenEPLB connected {R - 1} peers in {connect_s:.2f} s (NCCL buffers {nccl_mb:.0f} MB, max over "
@@ -782,13 +788,16 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self.layouts[li] = new
             self._stage_layer(li, p["tables"])
         self.pending_writes = True
-        self.c_gpu_ms = float(ins["recv"][0])
+        copy_ms = float(ins["recv"][0])
+        self.copy_ms_history = (self.copy_ms_history + [copy_ms])[-COPY_HISTORY:]
+        self.c_gpu_ms = float(np.median(self.copy_ms_history))
         self.install_count += 1
         if self.ep_rank == 0:
             copies = sum(len(p["copies"]) for p in ins["plans"])
             logger.info(
                 f"GenEPLB install {self.install_count} @replay {self.replays}: {len(ins['plans'])} layers, "
-                f"{copies} replicas, copy {self.c_gpu_ms:.3f} ms/layer (max over ranks)"
+                f"{copies} replicas, copy {copy_ms:.3f} ms/layer (max over ranks), gate estimate {self.c_gpu_ms:.3f} "
+                f"(median of {len(self.copy_ms_history)})"
             )
 
     def shutdown(self, local_safe: bool = True) -> bool:
