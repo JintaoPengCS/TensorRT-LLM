@@ -15,6 +15,7 @@ published once every rank's copies have landed.
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 from typing import Any, Optional
 
@@ -46,8 +47,8 @@ COPY_BUDGET_MS = 4.0
 # Live serving (requests keep arriving after the first renewal): a placement serves until the next install, not just
 # the requests in flight, so installs are priced over at least LIVE_HORIZON replays instead of the in-flight requests'
 # remaining steps (the fixed-batch rule), and a layer installs at most once per LIVE_COOLDOWN renewals (~500 replays; no
-# churn on noisy windows). Counted in renewals: replay counts differ between ranks (a rank's eager steps are not
-# replays), while every rank makes the same sequence of renewal decisions.
+# churn on noisy windows). Counted in renewal decisions, which every rank makes in the same sequence: a window's place
+# in replays is rank-local (each rank opens its next window after it applied the decision, at its own replay).
 LIVE_HORIZON = 2048
 LIVE_COOLDOWN = 32
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
@@ -378,13 +379,21 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             if got is not None:
                 self._apply_decision(got[1])
         if self.ready_vote is not None and self.ready_vote[0].Test():
-            first = int(self.ready_vote[1][1][0]) + INSTALL_MARGIN
-            plans = self.ready_vote[2]
-            chunk = self.ready_vote[3]
+            _, (_, out), plans, chunk = self.ready_vote
             self.ready_vote = None
-            self.installs.append(
-                dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk)
-            )
+            if (
+                out[1] != -out[3] or out[2] != -out[4]
+            ):  # MAX != MIN of the decision index or the plan digest
+                raise RuntimeError(
+                    f"GenEPLB rank {self.ep_rank}: the ranks' renewal decisions differ (decision "
+                    f"{-out[3]:.0f}..{out[1]:.0f}, plan digest {-out[4]:.0f}..{out[2]:.0f}); copying now would "
+                    "deadlock or copy the wrong experts"
+                )
+            if plans:
+                first = int(out[0]) + INSTALL_MARGIN
+                self.installs.append(
+                    dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk)
+                )
         self._poll_installs()
 
     def route(self, layer: GenEplbLayer, ids: torch.Tensor) -> torch.Tensor:
@@ -570,25 +579,30 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         for li, arrays in reply["tables"].items():
             self._stage_layer(li, arrays)
         self.pending_writes = True
-        if reply["installs"]:
-            from mpi4py import MPI
+        # Every renewal votes, with its index and a digest of its plan: the agreed copy step (MAX of the forwards
+        # + INSTALL_MARGIN) only pairs identical plans of the same renewal; any divergence raises before a copy.
+        from mpi4py import MPI
 
-            at = np.array([float(self.forwards)])
-            out = np.empty(1, dtype=np.float64)
-            for ins in reply["installs"]:
-                self.installed_at[ins["layer"]] = self.decisions
-            c = self.c_gpu_ms
-            chunk = (
-                max(1, min(LAYERS_PER_COPY_STEP, int(COPY_BUDGET_MS / c)))
-                if c
-                else LAYERS_PER_COPY_STEP
-            )
-            self.ready_vote = (
-                self.comm_ready.Iallreduce(at, out, op=MPI.MAX),
-                (at, out),
-                reply["installs"],
-                chunk,
-            )
+        for ins in reply["installs"]:
+            self.installed_at[ins["layer"]] = self.decisions
+        c = self.c_gpu_ms
+        chunk = (
+            max(1, min(LAYERS_PER_COPY_STEP, int(COPY_BUDGET_MS / c)))
+            if c
+            else LAYERS_PER_COPY_STEP
+        )
+        plan = [(ins["layer"], [tuple(cp) for cp in ins["copies"]]) for ins in reply["installs"]]
+        key = hashlib.blake2b(repr((self.decisions, chunk, plan)).encode(), digest_size=8).digest()
+        digest = float(int.from_bytes(key, "little") >> 12)  # 52 bits: exact in a float64
+        d = float(self.decisions)
+        vote = np.array([float(self.forwards), d, digest, -d, -digest])
+        out = np.empty(5, dtype=np.float64)
+        self.ready_vote = (
+            self.comm_ready.Iallreduce(vote, out, op=MPI.MAX),
+            (vote, out),
+            reply["installs"],
+            chunk,
+        )
         if self.ep_rank == 0:
             logger.info(
                 f"GenEPLB renewal {self.renewals} @replay {self.replays}: mode {self.mode}, T {self._last['tokens']}, "
