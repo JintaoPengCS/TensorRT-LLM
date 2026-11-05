@@ -1225,6 +1225,24 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             )
 
 
+def _with_atomic_counter_work_ids(candidates: List[Tuple]) -> List[Tuple]:
+    """Use dynamic work ids for helper-bearing (load-balanced) launches.
+
+    Per-layer dynamic EPLB launches MegaMoE on the full grid while the HALO-Q
+    + TMA copy kernel can still hold its auxiliary SMs, so CTAs that start late
+    must not own a static grid-stride share of the tiles. Every other knob
+    (tile, token-back mode, bulk FC2 store, stages, flag batches) is kept.
+    """
+    converted: List[Tuple] = []
+    for tactic in candidates:
+        tactic = list(tactic)
+        tactic[4] = "atomic_counter"
+        tactic = tuple(tactic)
+        if tactic not in converted:
+            converted.append(tactic)
+    return converted
+
+
 def _expand_megamoe_ready_tactics(
     candidates: list[Tuple], sm_version: int, *, load_balance: bool
 ) -> list[Tuple]:
@@ -1439,6 +1457,8 @@ def enumerate_megamoe_candidate_tactics(
         )
         validate_megamoe_tactic(tactic, sm_version=sm_version)
         candidates.append(tactic)
+    if load_balance:
+        candidates = _with_atomic_counter_work_ids(candidates)
     return _expand_megamoe_ready_tactics(candidates, sm_version, load_balance=load_balance)
 
 
@@ -2387,6 +2407,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
             )
+            if self.helper_expert_count > 0:
+                default_tactic = _with_atomic_counter_work_ids([default_tactic])[0]
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
             default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
