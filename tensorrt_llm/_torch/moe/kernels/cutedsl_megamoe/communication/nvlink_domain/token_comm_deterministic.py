@@ -880,6 +880,11 @@ class _MetadataPushRouter(KernelComponent):
         row_bytes = Int32(self.expert_count_padded * 4)
         matrix_address = self._device_workspace.ptr(self.sizes_by_rank_region).toint()
         total_address = self._device_workspace.ptr(self.sizes_region).toint()
+        # The counts were written through the generic proxy (smem atomics / st.shared); the bulk copy and reduce
+        # below read them through the async proxy: all writers fence, then the CTA barrier, then the issuers read.
+        # Without it a copy can carry a row that misses the last increments (EP32: lost / overwritten routes).
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_threads()
         rank_round_count = ceil_div(self.world_size, self.router_warps_per_cta)
         for rank_round in cutlass.range_constexpr(rank_round_count):
             destination_rank = self._router_warp_idx + Int32(rank_round * self.router_warps_per_cta)
