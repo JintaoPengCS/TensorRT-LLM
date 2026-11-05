@@ -38,6 +38,10 @@ RENEWAL_FLOOR = 12
 # layers whose replicas are copied between two consecutive replays.
 INSTALL_MARGIN = 8
 LAYERS_PER_COPY_STEP = 8
+# After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
+# (the shipped startup probe: the first gate prices installs with a measured copy cost).
+CONNECT_BYTES = 4 << 20
+PROBE_LAYERS = 2
 
 
 class GenEplbLayer:
@@ -290,6 +294,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.pending_writes = False
         self.renewals = self.install_count = 0
         self.c_gpu_ms = None
+        self.connected = False
         self.budgets = {}  # request id -> tokens it had produced at the previous step
         self.accept = None  # EMA (accepted tokens, request steps), weight 0.95 per step
         self.rem_sum, self.rem_count = 0.0, 0
@@ -560,8 +565,6 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         """Copy the replicas due before this replay. Every rank copies the same chunk of the plan between the
         same two replays (the agreed step), on the forward stream: the copies never run beside the MoE kernels,
         whose cross-rank barriers would otherwise wait on SMs the copies hold."""
-        import torch.distributed as dist
-
         for ins in self.installs:
             chunks = -(-len(ins["plans"]) // LAYERS_PER_COPY_STEP)
             step = ins["first"] + ins["issued"]
@@ -573,49 +576,104 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 )
             k = ins["issued"]
             plans = ins["plans"][k * LAYERS_PER_COPY_STEP : (k + 1) * LAYERS_PER_COPY_STEP]
-            M = self.geo.local_slots
-            ops, local = [], []
-            for p in plans:
-                for expert, dst in p["copies"]:
-                    src = self.geo.home_slot(expert)  # homes never move
-                    sr, dr = src // M, dst // M
-                    for _, t in self.slot_tensors[p["layer"]]:
-                        if sr == dr == self.ep_rank:
-                            local.append((t[dst % M], t[src % M]))
-                        elif sr == self.ep_rank:
-                            ops.append(
-                                dist.P2POp(dist.isend, t[src % M], dr, group=self.copy_group)
-                            )
-                        elif dr == self.ep_rank:
-                            ops.append(
-                                dist.P2POp(dist.irecv, t[dst % M], sr, group=self.copy_group)
-                            )
-            if ops:  # NCCL connects a pair at its first transfer: connect this chunk's pairs outside the timing
-                probes = [
-                    dist.P2POp(
-                        kind,
-                        self._probe[0:1]
-                        if kind is dist.isend
-                        else self._probe[1 + peer : 2 + peer],
-                        peer,
-                        group=self.copy_group,
-                    )
-                    for peer, kind in sorted(
-                        {(op.peer, op.op) for op in ops},
-                        key=lambda pk: (pk[0], pk[1] is dist.irecv),
-                    )
-                ]
-                for w in dist.batch_isend_irecv(probes):
-                    w.wait()
-            start, done = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record()
-            for dst_t, src_t in local:
-                dst_t.copy_(src_t, non_blocking=True)
-            for w in dist.batch_isend_irecv(ops) if ops else []:
-                w.wait()  # the forward stream waits for the copies: the next replay reads after them
-            done.record()
-            ins["events"].append((start, done, len(plans)))
+            ins["events"].append((*self._copy_layers(plans), len(plans)))
             ins["issued"] += 1
+
+    def _copy_layers(self, plans):
+        """Copy the plans' replicas from their home slots, on the current stream: (start, done) timing events."""
+        import torch.distributed as dist
+
+        M = self.geo.local_slots
+        ops, local = [], []
+        for p in plans:
+            for expert, dst in p["copies"]:
+                src = self.geo.home_slot(expert)  # homes never move
+                sr, dr = src // M, dst // M
+                for _, t in self.slot_tensors[p["layer"]]:
+                    if sr == dr == self.ep_rank:
+                        local.append((t[dst % M], t[src % M]))
+                    elif sr == self.ep_rank:
+                        ops.append(dist.P2POp(dist.isend, t[src % M], dr, group=self.copy_group))
+                    elif dr == self.ep_rank:
+                        ops.append(dist.P2POp(dist.irecv, t[dst % M], sr, group=self.copy_group))
+        if (
+            ops and not self.connected
+        ):  # NCCL connects a pair at its first transfer: not inside the timing
+            probes = [
+                dist.P2POp(
+                    kind,
+                    self._probe[0:1] if kind is dist.isend else self._probe[1 + peer : 2 + peer],
+                    peer,
+                    group=self.copy_group,
+                )
+                for peer, kind in sorted(
+                    {(op.peer, op.op) for op in ops}, key=lambda pk: (pk[0], pk[1] is dist.irecv)
+                )
+            ]
+            for w in dist.batch_isend_irecv(probes):
+                w.wait()
+        start, done = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for dst_t, src_t in local:
+            dst_t.copy_(src_t, non_blocking=True)
+        for w in dist.batch_isend_irecv(ops) if ops else []:
+            w.wait()  # the forward stream waits for the copies: the next replay reads after them
+        done.record()
+        return start, done
+
+    def after_warmup(self) -> None:
+        """Once the final KV cache and CUDA graphs are allocated: connect every NCCL peer (NCCL connects a pair at
+        its first transfer, which would otherwise stall the first install's steps) and time a startup copy of
+        PROBE_LAYERS layers into FREE spare slots, so the first gate prices installs with a measured copy cost.
+        Collective on every rank; once."""
+        if not self.finalized or self.connected:
+            return
+        import time
+
+        import torch.distributed as dist
+        from mpi4py import MPI
+
+        self.connected = True
+        R, r = self.ep_size, self.ep_rank
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        send = torch.zeros(CONNECT_BYTES, dtype=torch.uint8, device=self.device)
+        recv = torch.empty((R, CONNECT_BYTES), dtype=torch.uint8, device=self.device)
+        free0 = torch.cuda.mem_get_info(self.device)[0]
+        peers = [p for p in range(R) if p != r]
+        ops = [dist.P2POp(dist.isend, send, p, group=self.copy_group) for p in peers]
+        ops += [dist.P2POp(dist.irecv, recv[p], p, group=self.copy_group) for p in peers]
+        for w in dist.batch_isend_irecv(ops) if ops else []:
+            w.wait()
+        torch.cuda.synchronize()
+        nccl_mb = (free0 - torch.cuda.mem_get_info(self.device)[0]) / 2**20
+        connect_s = time.perf_counter() - t0
+        del send, recv
+        # Probe: every rank receives the first replicas-per-rank home experts of the next rank into its first spare
+        # slots (FREE: no rank routes there; a later install overwrites them).
+        geo, n = self.geo, max(1, (self.geo.local_slots - self.geo.homes) // 2)
+        plans = [
+            dict(
+                layer=li,
+                copies=[
+                    (((d + 1) % R) * geo.homes + j, d * geo.local_slots + geo.homes + j)
+                    for d in range(R)
+                    for j in range(n)
+                ],
+            )
+            for li in range(min(PROBE_LAYERS, self.num_layers))
+        ]
+        start, done = self._copy_layers(plans)
+        done.synchronize()
+        probe_ms = start.elapsed_time(done) / len(plans)
+        connect_s, nccl_mb, self.c_gpu_ms = (
+            self.comm_done.allreduce(v, op=MPI.MAX) for v in (connect_s, nccl_mb, probe_ms)
+        )
+        if r == 0:
+            logger.info(
+                f"GenEPLB connected {R - 1} peers in {connect_s:.2f} s (NCCL buffers {nccl_mb:.0f} MB, max over "
+                f"ranks); startup copy probe {len(plans)} layers x {n} replicas/rank: c_gpu_ms {self.c_gpu_ms:.3f}"
+            )
 
     def _poll_installs(self) -> None:
         """Vote once this rank's copies of an install landed; publish once every rank's have. Never blocks: a
