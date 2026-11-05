@@ -34,10 +34,22 @@ from .worker import Worker
 WINDOW = 8
 OPENING_WINDOW = 1
 RENEWAL_FLOOR = 12
+# Dormant (no layer holds a replica and the last gate admitted none): one counted window per this many replays, main's
+# plain routing (no padding spread) and an idle statistics kernel (enable word 0) in between.
+DORMANT_PERIOD = 256
 # Installs: replays between the last rank's ready vote and the agreed first copy step, and the
 # layers whose replicas are copied between two consecutive replays.
 INSTALL_MARGIN = 8
 LAYERS_PER_COPY_STEP = 8
+# Copy time an install may add to one replay: a large install is spread over more replays when copies are slow.
+COPY_BUDGET_MS = 4.0
+# Live serving (requests keep arriving after the first renewal): a placement serves until the next install, not just
+# the requests in flight, so installs are priced over at least LIVE_HORIZON replays instead of the in-flight requests'
+# remaining steps (the fixed-batch rule), and a layer installs at most once per LIVE_COOLDOWN renewals (~500 replays; no
+# churn on noisy windows). Counted in renewals: replay counts differ between ranks (a rank's eager steps are not
+# replays), while every rank makes the same sequence of renewal decisions.
+LIVE_HORIZON = 2048
+LIVE_COOLDOWN = 32
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
 CONNECT_BYTES = 4 << 20
@@ -295,6 +307,12 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.renewals = self.install_count = 0
         self.c_gpu_ms = None
         self.connected = False
+        # No replica held and the last gate admitted none (set by each renewal).
+        self.dormant = False
+        self.live = False  # requests arrived after the first renewal on some rank (from the gathered counts)
+        self.arrivals = 0  # this rank's requests that started decoding since the last gather
+        self.decisions = 0  # renewal decisions requested (the same sequence on every rank)
+        self.installed_at = {}  # layer -> the decision that installed it
         self.budgets = {}  # request id -> tokens it had produced at the previous step
         self.accept = None  # EMA (accepted tokens, request steps), weight 0.95 per step
         self.rem_sum, self.rem_count = 0.0, 0
@@ -312,7 +330,6 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         gen = [r for r in scheduled_requests.generation_requests if not _is_dummy(r)]
         self.draft_len = int(draft_len)
         rows = len(gen) * (1 + self.draft_len)
-        self._set_words(rows if counted else native.VALID_ALL, 1 if counted else 0)
         if counted:
             self._track_budgets(gen)
             if self.replays == self.window_start and self.window_end is None:
@@ -321,6 +338,11 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 self.window_end, self.window_open, self.window_rows = self.replays + n, True, 0
             if self.window_open:
                 self.window_rows = max(self.window_rows, rows)
+        # The statistics kernel counts only a window's replays; a dormant balancer routes like main between its
+        # windows (no padding spread), so its words stay put and no step writes them.
+        window = counted and self.window_open
+        spread = window or (counted and not self.dormant)
+        self._set_words(rows if spread else native.VALID_ALL, 1 if window else 0)
         self._advance()
         self._copy_due()
         if self.pending_writes:
@@ -358,8 +380,11 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         if self.ready_vote is not None and self.ready_vote[0].Test():
             first = int(self.ready_vote[1][1][0]) + INSTALL_MARGIN
             plans = self.ready_vote[2]
+            chunk = self.ready_vote[3]
             self.ready_vote = None
-            self.installs.append(dict(plans=plans, first=first, issued=0, events=[], vote=None))
+            self.installs.append(
+                dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk)
+            )
         self._poll_installs()
 
     def route(self, layer: GenEplbLayer, ids: torch.Tensor) -> torch.Tensor:
@@ -426,6 +451,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         (a client max_tokens far above the real lengths would otherwise inflate the horizon)."""
         app = rc = 0
         seen, rem = {}, 0.0
+        if self.renewals:
+            self.arrivals += sum(r.py_request_id not in self.budgets for r in gen)
         for r in gen:
             rid = r.py_request_id
             produced = int(r.get_num_tokens(0)) - int(r.py_prompt_len)
@@ -457,7 +484,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 self.snap_load.numpy().astype(np.float64).ravel(),
                 self.snap_steps.numpy().astype(np.float64),
                 np.array(
-                    [self.rem_sum, self.rem_count, acc[0], acc[1], self.window_rows],
+                    [self.rem_sum, self.rem_count, acc[0], acc[1], self.window_rows, self.arrivals],
                     dtype=np.float64,
                 ),
             ]
@@ -470,6 +497,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             local,
         )  # buffers live until done
         self.snap_event = None
+        self.arrivals = 0
 
     def _start_decision(self) -> None:
         _, recv, n, _ = self.gather
@@ -485,10 +513,24 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         tail = rows[:, L * E + L :]
         rem_sum, count, app, rc = (float(tail[:, i].sum()) for i in range(4))
         tokens = int(tail[:, 4].max())  # T: the largest real decode rows of one replay on any rank
+        if tokens == 0 or not totals.any():
+            # An idle window (no real decode rows on any rank): nothing to renew.
+            self._next_window()
+            return
         accepted = (
             (app / rc) if rc > 0 else float(self.draft_len + 1)
         )  # before any step is measured: the bound
         n_rem = (rem_sum / accepted / count) if count > 0 and accepted > 0 else None
+        # Live once any rank saw a request start decoding after the first renewal (the same gathered counts on every
+        # rank, so every rank prices the same way).
+        self.live = self.live or bool(tail[:, 5].sum() > 0)
+        self.decisions += 1
+        frozen = []
+        if self.live:
+            n_rem = max(n_rem or 0.0, float(LIVE_HORIZON))
+            frozen = [
+                li for li, at in self.installed_at.items() if self.decisions - at < LIVE_COOLDOWN
+            ]
         geo = self.geo
         b_params = costmodel.prior_params(max(1, tokens)) if self.mode == "B" else None
         self._last = dict(n_rem=n_rem, tokens=tokens)
@@ -511,6 +553,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 layouts={li: self.layouts[li] for li in range(L)},
                 retired=self.retired,
                 n_rem=n_rem,
+                frozen=frozen,
                 c_gpu_ms=self.c_gpu_ms,
                 total_active=geo.active_slots,
                 cap=geo.local_slots - geo.homes,
@@ -532,19 +575,38 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
 
             at = np.array([float(self.forwards)])
             out = np.empty(1, dtype=np.float64)
+            for ins in reply["installs"]:
+                self.installed_at[ins["layer"]] = self.decisions
+            c = self.c_gpu_ms
+            chunk = (
+                max(1, min(LAYERS_PER_COPY_STEP, int(COPY_BUDGET_MS / c)))
+                if c
+                else LAYERS_PER_COPY_STEP
+            )
             self.ready_vote = (
                 self.comm_ready.Iallreduce(at, out, op=MPI.MAX),
                 (at, out),
                 reply["installs"],
+                chunk,
             )
         if self.ep_rank == 0:
             logger.info(
                 f"GenEPLB renewal {self.renewals} @replay {self.replays}: mode {self.mode}, T {self._last['tokens']}, "
                 f"shares {len(reply['tables'])} layers, gate {len(reply['installs'])}/{reply['candidates']} layers, "
-                f"N_rem {self._last['n_rem']}, c_gpu_ms {self.c_gpu_ms}"
+                f"N_rem {self._last['n_rem']}{' (live horizon)' if self.live else ''}, c_gpu_ms {self.c_gpu_ms}"
             )
-        self.window_start = max(self.replays + 1, self.window_end + RENEWAL_FLOOR - WINDOW)
+        self.dormant = not reply["installs"] and not self._holds_replicas()
+        self._next_window()
+
+    def _next_window(self) -> None:
+        gap = DORMANT_PERIOD if self.dormant else RENEWAL_FLOOR - WINDOW
+        self.window_start = max(self.replays + 1, self.window_end + gap)
         self.window_end = None
+
+    def _holds_replicas(self) -> bool:
+        """Whether any layer has a copy in a spare slot (its layout differs from the home layout)."""
+        M, H = self.geo.local_slots, self.geo.homes
+        return any(lay[s] >= 0 for lay in self.layouts for s in range(len(lay)) if s % M >= H)
 
     def _stage_layer(self, li: int, arrays) -> None:
         self.h_count[li], self.h_start[li], self.h_slots[li], self.h_cumw[li] = arrays
@@ -566,7 +628,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         same two replays (the agreed step), on the forward stream: the copies never run beside the MoE kernels,
         whose cross-rank barriers would otherwise wait on SMs the copies hold."""
         for ins in self.installs:
-            chunks = -(-len(ins["plans"]) // LAYERS_PER_COPY_STEP)
+            chunks = -(-len(ins["plans"]) // ins["chunk"])
             step = ins["first"] + ins["issued"]
             if ins["issued"] >= chunks or self.forwards < step:
                 continue
@@ -575,7 +637,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                     f"GenEPLB rank {self.ep_rank}: forward {self.forwards} is past the agreed copy step {step}"
                 )
             k = ins["issued"]
-            plans = ins["plans"][k * LAYERS_PER_COPY_STEP : (k + 1) * LAYERS_PER_COPY_STEP]
+            plans = ins["plans"][k * ins["chunk"] : (k + 1) * ins["chunk"]]
             ins["events"].append((*self._copy_layers(plans), len(plans)))
             ins["issued"] += 1
 
@@ -663,8 +725,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             )
             for li in range(min(PROBE_LAYERS, self.num_layers))
         ]
-        start, done = self._copy_layers(plans)
-        done.synchronize()
+        for _ in range(2):  # the second, warm copy prices installs (the first pays one-time setup)
+            start, done = self._copy_layers(plans)
+            done.synchronize()
         probe_ms = start.elapsed_time(done) / len(plans)
         connect_s, nccl_mb, self.c_gpu_ms = (
             self.comm_done.allreduce(v, op=MPI.MAX) for v in (connect_s, nccl_mb, probe_ms)
@@ -682,7 +745,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             ins = self.installs[0]
             if ins["vote"] is None:
                 if (
-                    ins["issued"] < -(-len(ins["plans"]) // LAYERS_PER_COPY_STEP)
+                    ins["issued"] < -(-len(ins["plans"]) // ins["chunk"])
                     or not ins["events"][-1][1].query()
                 ):
                     return

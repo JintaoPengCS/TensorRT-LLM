@@ -173,7 +173,8 @@ def decide(req: dict) -> dict:
 
     req: geo (Geometry fields), mode 'C' | 'B', b_params, gate_model, totals {layer: every expert's statistics
     EMA summed over ranks}, scales {layer: EMA scale to per-launch rows}, layouts {layer: current layout},
-    retired {layer: slots the last install freed}, b_layers {layer: True when B's solver prices it}, n_rem,
+    retired {layer: slots the last install freed}, b_layers {layer: True when B's solver prices it}, n_rem (the
+    payback horizon in steps), frozen (layers that may not install this renewal),
     c_gpu_ms (measured copy ms of one layer, None before the first install), total_active, cap, install
     (False: shares only), max_layers. As shipped: the plan and the C split read the totals, the gate and B
     read the per-launch rows totals x scale.
@@ -184,6 +185,7 @@ def decide(req: dict) -> dict:
     geo = Geometry(**req["geo"])
     E, n_rem = geo.experts, req["n_rem"]
     c_gpu = req["c_gpu_ms"] or 0.0
+    frozen = set(req.get("frozen", ()))
     out_tables, cands, plans = {}, {}, {}
     for layer in sorted(req["totals"]):
         totals, scale = req["totals"][layer], req["scales"][layer]
@@ -193,7 +195,7 @@ def decide(req: dict) -> dict:
         model = req["gate_model"] if lmode == "B" else GATE_MODEL_T
         w_cur = solve_weights(lmode, totals, scale, cur, geo, req["b_params"])
         out_tables[layer] = tables(cur, w_cur, E)
-        if not req["install"] or n_rem is None or sum(totals) <= 0.0:
+        if not req["install"] or n_rem is None or sum(totals) <= 0.0 or layer in frozen:
             continue
         plan = fixedhome_targets(totals, geo, req["total_active"], req["cap"])
         new, copies = sticky_layout(cur, plan, geo, req["retired"].get(layer, ()))

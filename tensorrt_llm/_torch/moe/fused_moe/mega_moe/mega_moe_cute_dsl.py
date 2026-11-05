@@ -286,6 +286,15 @@ def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
 
 
 @functools.cache
+def _log_geneplb_staging(bucket: int, in_place: bool) -> None:
+    """Rank 0, once per launch bucket: GenEPLB B's staging cuts are in this bucket's captured launches."""
+    logger.info(
+        f"GenEPLB B staging bucket {bucket}: slots and weights written by the route kernel, activation "
+        f"quantized {'in place' if in_place else 'then copied'}"
+    )
+
+
+@functools.cache
 def _fp4_quantize_has_sm_budget() -> bool:
     if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
         return True
@@ -1946,9 +1955,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # straight into its index / weight rows: no staging copies.
             if num_tokens > 0:
                 x_fp4, x_sf = self.quantize_input(x, out=(bufs.activation, bufs.activation_sf))
-                if x_fp4.data_ptr() != bufs.activation.data_ptr():
+                in_place = x_fp4.data_ptr() == bufs.activation.data_ptr()
+                if not in_place:
                     bufs.activation[:num_tokens].copy_(x_fp4.view(torch.uint8), non_blocking=True)
                     bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+                if self.ep_rank == 0:
+                    _log_geneplb_staging(launch_max_T, in_place)
             self._route_stager(topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights)
             self._last_staged_T[launch_max_T] = num_tokens
         use_direct_inputs = (
