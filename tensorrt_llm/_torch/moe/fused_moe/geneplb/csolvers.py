@@ -31,7 +31,7 @@ B_SOURCES = ("l3b_core.c", "l3_core.c")
 CFLAGS = ("-O2", "-ffp-contract=off", "-fPIC", "-shared", "-std=c11")
 BUILD_TIMEOUT_S = 120
 CACHE_ENV = "TRTLLM_GENEPLB_CACHE_DIR"
-N_PAR, N_DIAG = 16, 24  # l3b_core.c N_PAR / N_DIAG (l3b_layout)
+N_PAR, N_DIAG = 20, 24  # l3b_core.c N_PAR / N_DIAG (l3b_layout); P5: + act_k, act_var, 2 reserved
 
 _LOCK = threading.Lock()
 _LIBS = {}  # (library stem, cache dir) -> ctypes.CDLL: one build key and load per process

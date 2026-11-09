@@ -1,0 +1,49 @@
+{
+ "schema": "geneplb_costmodel_b_prior_v2",
+ "status": "Calibrated rows: coefficients = GB300 per-rank 'hot' fits of a MegaMoE MoE-only micro-benchmark (real DSV4-Pro layers, bucket = T, eager); activity model fitted on real DSV4 decode routing thinned to the per-bucket loads of the tuned deployments. Refit cf / cl / cc / ch / a on the CUDA-graph decode kernel (bucket 256) before trusting absolute numbers (the warm-up micro-benchmark, costmb.py, does this per run); rmse_us null until then.",
+ "tier_rule": "one rule for coefficients and pricing: the row of the largest key <= T (T = the balancer's T, max real decode rows of one replay on any rank); T below the smallest key takes the smallest row (flagged extrapolated)",
+ "fields": {
+  "cf": "us per active copy (first 256-row tile: one 37.16 MB NVFP4 weight stream)",
+  "cl": "us per extra 256-row tile on any copy",
+  "cc": "us per routed row",
+  "ch": "us per extra tile of the rank's hottest copy",
+  "a": "us fixed per layer (not used by the objective; kept for absolute predictions)",
+  "act_k": "negative-binomial shape of a copy's rows per replay: P(active) = 1 - (1 + (x + lam0) / k)^-k",
+  "act_lam0": "rows per replay added to every expert's window rate (8-replay estimates regress to the mean; zero-load homes are active 8-11 % of the next steps)",
+  "tile_disp": "variance / mean of a copy's rows for the later-tile expectation (as the shipped poisson presets)",
+  "gate_margin_us": "a split or plan must beat identity (home-only routing) by this many us per layer-step",
+  "per_rank": "placement flex: replicas (options) per home rank",
+  "keep_bonus": "placement flex: a held replica's expert ranks as if its rate were (1 + keep_bonus) x higher",
+  "place_min_gain_us": "placement greedy (experimental): smallest move kept",
+  "new_penalty_us": "placement greedy (experimental): a new replica must beat a held one by this"
+ },
+ "ep16": {
+  "local_slots": 28,
+  "homes": 24,
+  "rows": {
+   "1": {"cf": 5.714, "cl": 0.0, "cc": 0.0095, "ch": 3.030, "a": 43.48, "act_k": 8.0, "act_lam0": 0.1, "tile_disp": 8.0, "rmse_us": null,
+         "source": "EP16 T32 hot fit (rows/rank 32); act fit at the DEP16 bucket b12 (T48 padded, real max ~43)"},
+   "40": {"cf": 5.544, "cl": 2.940, "cc": 0.00403, "ch": 0.578, "a": 50.10, "act_k": 8.0, "act_lam0": 0.1, "tile_disp": 4.0, "rmse_us": null,
+          "source": "EP16 T64 hot fit; act fit at the DEP16 bucket b12-b20 (T48-80)"},
+   "96": {"cf": 5.406, "cl": 3.192, "cc": 0.00450, "ch": 0.206, "a": 55.45, "act_k": 8.0, "act_lam0": 0.1, "tile_disp": 4.0, "rmse_us": null,
+          "source": "EP16 T128 hot fit; act fit at the DEP16 bucket b32 (T128)"},
+   "136": {"cf": 5.406, "cl": 3.192, "cc": 0.00450, "ch": 0.206, "a": 55.45, "act_k": 12.0, "act_lam0": 0.1, "tile_disp": 4.0, "rmse_us": null,
+           "source": "EP16 T128 hot fit; act fit at the DEP16 bucket b36-b44 (T144-176)"}
+  }
+ },
+ "ep32": {
+  "local_slots": 16,
+  "homes": 12,
+  "rows": {
+   "1": {"cf": 5.014, "cl": 0.767, "cc": 0.01184, "ch": 2.217, "a": 55.45, "act_k": 1.0, "act_lam0": 0.1, "tile_disp": 8.0, "rmse_us": null,
+         "source": "EP32 T32 hot fit; act fit at the DEP32 bucket b2 (T8 padded, 12 idle ranks: batch-size variation -> overdispersed)"},
+   "12": {"cf": 5.014, "cl": 0.767, "cc": 0.01184, "ch": 2.217, "a": 55.45, "act_k": 6.0, "act_lam0": 0.075, "tile_disp": 8.0, "rmse_us": null,
+          "source": "EP32 T32 hot fit; act fit at the DEP32 bucket b4 (T16, real max ~13)"},
+   "20": {"cf": 5.014, "cl": 0.767, "cc": 0.01184, "ch": 2.217, "a": 55.45, "act_k": 8.0, "act_lam0": 0.1, "tile_disp": 8.0, "rmse_us": null,
+          "source": "EP32 T32 hot fit; act fit at the DEP32 bucket b8 (T32, real max ~21)"},
+   "48": {"cf": 4.856, "cl": 3.370, "cc": 0.00637, "ch": 0.502, "a": 59.89, "act_k": 8.0, "act_lam0": 0.1, "tile_disp": 4.0, "rmse_us": null,
+          "source": "EP32 T64 hot fit (no DEP32 decode bucket this large)"}
+  }
+ },
+ "defaults": {"gate_margin_us": 0.5, "per_rank": 2, "keep_bonus": 0.25, "place_min_gain_us": 0.05, "new_penalty_us": 0.5}
+}

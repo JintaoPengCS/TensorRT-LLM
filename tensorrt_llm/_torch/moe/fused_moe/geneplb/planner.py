@@ -13,19 +13,149 @@ rule, gain per step x remaining steps > the measured copy time of one layer.
 import hashlib
 import heapq
 import math
+import os
+import sys
 import struct
 
 try:
-    from . import costmodel, shares
+    from . import costmodel, placement_ef, shares
     from .geometry import Geometry
 except ImportError:  # imported standalone by the planner worker
     import costmodel
+    import placement_ef
     import shares
     from geometry import Geometry
 
 LAMBDA = 0.95  # the statistics kernel's EMA weight (stats_kernels.cu)
 # The gate model of C (form T, the microbenchmark fit).
 GATE_MODEL_T = dict(form="T", m=256, slope_us=0.0125, beta_us=0.009, tau_w_us=0.0)
+
+
+# ================================================================================================ P5 / P6 controls
+# Both default to the shipped behaviour.  Read once per process: the planner worker inherits the serving process's environment.
+#   TLLM_GENEPLB_OBJECTIVE  mean (shipped: cost model B on the window means, LSE tau 0.5, F = [mean rows > 0])
+#                           ef   (P5: placement_ef's expected-max objective on the prior v2 row of (EP, T): a copy is charged
+#                                 cf x P(active per replay), zero-load homes by activity, LSE tau from the per-step dispersion;
+#                                 shares by l3b_core.c pricing 2 (never a q=1 split), home-only unless the pick beats it by
+#                                 gate_margin_us; layer_us -- hence decide()'s install gate -- prices layouts with it too)
+#   TLLM_GENEPLB_PLACEMENT  lpt  (shipped rows-LPT)
+#                           flex (P6: every rank's 2 most loaded homes get a replica = options for the fast level's
+#                                 whole-expert moves; needs OBJECTIVE ef)
+#                           greedy (experimental: placement_ef.place, greedy by the change of the eF objective; needs ef)
+def _control(name: str, default: str, allowed) -> str:
+    v = os.environ.get(name, default).strip().lower()
+    if v not in allowed:
+        print("GenEPLB planner: %s=%r is not one of %s; using %r" % (name, v, allowed, default), file=sys.stderr)
+        v = default
+    return v
+
+
+OBJECTIVE = _control("TLLM_GENEPLB_OBJECTIVE", "mean", ("mean", "ef"))
+PLACEMENT = _control("TLLM_GENEPLB_PLACEMENT", "lpt", ("lpt", "flex", "greedy"))
+if PLACEMENT != "lpt" and OBJECTIVE != "ef":
+    print("GenEPLB planner: TLLM_GENEPLB_PLACEMENT=%s needs TLLM_GENEPLB_OBJECTIVE=ef; using lpt" % PLACEMENT, file=sys.stderr)
+    PLACEMENT = "lpt"
+_EF = {}  # the layer under decision (decide() solves its CURRENT layout first): totals, rates, params, model, tau, cur, hint
+_EF_PARAMS = {}  # (T, ranks, local_slots) -> the prior v2 params
+
+
+def _ef_params(b_params: dict, geo: Geometry) -> dict:
+    key = (int(b_params["T"]), int(geo.ranks), int(geo.local_slots))
+    p = _EF_PARAMS.get(key)
+    if p is None:
+        p = _EF_PARAMS[key] = costmodel.params_ef(*key)
+    return p
+
+
+def _ef_layer(totals, scale: float, geo: Geometry, b_params: dict) -> dict:
+    """The eF context of the layer under decision, built at its first solve (the same ``totals`` object all along)."""
+    if _EF.get("totals") is totals and _EF.get("scale") == scale:
+        return _EF
+    p = _ef_params(b_params, geo)
+    m = placement_ef.Model.from_params(p, geo.ranks)
+    rates = [float(t) * float(scale) for t in totals]
+    _EF.clear()
+    _EF.update(
+        totals=totals, scale=scale, params=p, model=m, rates=rates, cur=None, hint=None,
+        tau=placement_ef.identity_tau(m, rates, geo.ranks, geo.homes),
+    )
+    return _EF
+
+
+def _home_weights(phys, geo: Geometry) -> list:
+    M, H = geo.local_slots, geo.homes
+    return [1.0 if (e >= 0 and s % M < H) else 0.0 for s, e in enumerate(phys)]
+
+
+def _hint_weights(phys, hint: dict, geo: Geometry):
+    """The placement's intended shares on ``phys`` (None when a hinted replica did not land: sticky_layout's wave)."""
+    M, H = geo.local_slots, geo.homes
+    w = _home_weights(phys, geo)
+    for e, lst in hint.items():
+        for r, sh in lst:
+            if r == e // H:
+                w[r * M + e % H] = float(sh)
+                continue
+            s = next((r * M + j for j in range(H, M) if phys[r * M + j] == e), None)
+            if s is None:
+                return None
+            w[s] = float(sh)
+    return w
+
+
+def _solve_weights_ef(totals, scale, phys, geo: Geometry, b_params: dict) -> list:
+    """P5 fast level: the lowest eF objective of {l3b_core.c pricing 2 on rates + lam0, the plan's hint}, or the home-only
+    split (identity routing) unless that beats it by gate_margin_us."""
+    ctx = _ef_layer(totals, scale, geo, b_params)
+    if ctx["cur"] is None:
+        ctx["cur"] = list(phys)
+    p, m, tau, rates = ctx["params"], ctx["model"], ctx["tau"], ctx["rates"]
+    R, M = geo.ranks, geo.local_slots
+    w_home = _home_weights(phys, geo)
+    J_home = placement_ef.layer_J(m, rates, phys, w_home, R, M, tau=tau)[0]
+    best_w, best_J = w_home, J_home
+    if float(scale) > 0.0:
+        load = [float(t) + p["act_lam0"] / float(scale) for t in totals]
+        w = shares.solve_b(load, phys, float(scale), M, costmodel.l3b_params_ef(p, tau))
+        if w is not None:
+            w = [float(x) for x in w]
+            J = placement_ef.layer_J(m, rates, phys, w, R, M, tau=tau)[0]
+            if J < best_J:
+                best_w, best_J = w, J
+    if ctx["hint"]:
+        w2 = _hint_weights(phys, ctx["hint"], geo)
+        if w2 is not None:
+            J2 = placement_ef.layer_J(m, rates, phys, w2, R, M, tau=tau)[0]
+            if J2 < best_J - 1e-9:
+                best_w, best_J = w2, J2
+    if J_home - best_J < p["gate_margin_us"]:
+        return w_home
+    return best_w
+
+
+def _fixedhome_targets_ef(geo: Geometry, total_active: int, cap: int) -> dict:
+    """P6 plan of the layer under decision ({expert: [ranks]}, as fixedhome_targets): flex options, or the greedy plan unless it
+    beats identity by gate_margin_us."""
+    ctx = _EF
+    p = ctx["params"]
+    M, H = geo.local_slots, geo.homes
+    cur = ctx.get("cur") or []
+    held = {e: s // M for s, e in enumerate(cur) if e >= 0 and s % M >= H}
+    if PLACEMENT == "flex":
+        ctx["hint"] = None
+        return placement_ef.flex(
+            ctx["model"], ctx["rates"], geo.ranks, H, total_active - geo.experts, cap, per_rank=int(p["per_rank"]),
+            held=held, keep_bonus=p["keep_bonus"],
+        )
+    res = placement_ef.place(
+        ctx["model"], ctx["rates"], geo.ranks, H, total_active - geo.experts, cap, min_gain_us=p["place_min_gain_us"],
+        keep=set(held.items()), new_penalty_us=p["new_penalty_us"], tau=ctx["tau"],
+    )
+    if res["J_identity"] - res["J"] < p["gate_margin_us"]:
+        ctx["hint"] = None
+        return {}
+    ctx["hint"] = res["shares"]
+    return {e: list(rs) for e, rs in res["plan"].items()}
 
 
 def _f32(x: float) -> float:
@@ -63,6 +193,8 @@ def fixedhome_targets(load, geo: Geometry, total_active: int, cap: int) -> dict:
     least-loaded rank with room under ``cap`` that does not hold the expert (ties to the smaller rank),
     a second copy on one rank only when every rank with room holds it -- the shipped planner's order.
     """
+    if PLACEMENT != "lpt" and _EF.get("totals") is load:  # P6 (decide() solved this layer's current layout first)
+        return _fixedhome_targets_ef(geo, total_active, cap)
     E, R, H = geo.experts, geo.ranks, geo.homes
     load = [_f32(float(x)) for x in load]
     counts = do_replication(load, total_active, E)
@@ -143,12 +275,20 @@ def source_slot(layout: list, expert: int, geo: Geometry) -> int:
 
 def layer_us(model: dict, cbar, phys, weights, geo: Geometry) -> float:
     """Busiest GPU's MoE microseconds of one layer under ``phys`` / ``weights`` (form T or B)."""
+    if OBJECTIVE == "ef" and costmodel.is_b(model) and "T" in model:  # P5: the eF objective prices the gate's layouts
+        p = _ef_params(model, geo)
+        m = placement_ef.Model.from_params(p, geo.ranks)
+        rates = [float(x) for x in cbar]
+        tau = placement_ef.identity_tau(m, rates, geo.ranks, geo.homes)
+        return float(placement_ef.layer_J(m, rates, phys, weights, geo.ranks, geo.local_slots, tau=tau)[0])
     return float(costmodel.layer_us(model, cbar, phys, weights, geo.ranks))
 
 
 def solve_weights(mode: str, totals, scale: float, phys, geo: Geometry, b_params):
     """Per-slot shares of ``phys`` (C: the rows split of the window totals; B: cost model B on the per-launch rows
     totals x scale; a refused B input falls back to the rows split, as shipped)."""
+    if OBJECTIVE == "ef" and mode == "B" and b_params is not None:  # P5
+        return _solve_weights_ef(totals, scale, phys, geo, b_params)
     if mode == "B" and b_params is not None:
         w = shares.solve_b(totals, phys, float(scale), geo.local_slots, b_params)
         if w is not None:

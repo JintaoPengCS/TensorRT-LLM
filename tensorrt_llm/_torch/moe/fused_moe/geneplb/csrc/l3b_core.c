@@ -29,7 +29,7 @@
 int l3_weights_full(int E, int R, int LS, const double *load, int n_slots, const int *phys, int align_tile, double tile,
                     double *w, double *T_out, int *improved, int mode, double g, int max_newton, int *stats);
 
-#define N_PAR 16
+#define N_PAR 20                /* P5: 16 shipped + act_k, act_var, 2 reserved (pricing 2) */
 #define N_DIAG 24
 #define TAU_MAX_RULE 0.06
 #define HOT_EPS 1e-9
@@ -43,6 +43,7 @@ int l3_weights_full(int E, int R, int LS, const double *load, int n_slots, const
 #define MAX_INT_PAR 1e6         /* max_act_steps, polish_iters, c_mode, c_max_newton, lse_top: integer-valued, <= this */
 #define MAX_LOAD 1e15           /* rows per replay of one expert */
 #define DISP_MAX 64.0           /* pricing poisson: 0 < disp <= this */
+#define ACT_K_MAX 1e6           /* pricing 2 (eF): 0 <= act_k <= this */
 #define ZCUT 8.0                /* pricing poisson: boundaries more than ZCUT sigma away count 1 (below) or 0 (above) */
 #define MAXJ 64                 /* pricing poisson: at most this many boundary terms per copy */
 #define QCACHE 4096             /* pricing poisson: entries of the per-solve qexp memo (a power of two) */
@@ -206,8 +207,9 @@ typedef struct {
     int E, R, LS, n_slots;
     double cf, cl, cc, ch, tau, tile, margin, tol;
     double inv_tile;              /* 1 / tile when tile is a power of two (x / tile == x * inv_tile exactly), else 0 */
-    int pricing;                  /* 0 mean, 1 poisson (qexp with disp) */
+    int pricing;                  /* 0 mean, 1 poisson (qexp with disp), 2 eF (activity + qexp; P5) */
     double disp;
+    double act_k, act_var;        /* pricing 2: NB shape of a copy's rows (0 Poisson), variance weight cf^2 / (2 tau) */
     double *qc_x, *qc_q;          /* pricing poisson: [QCACHE] memo of qexp (a pure function of x within a solve; 0 = empty slot) */
     int max_act, polish_iters, top;
     int m, P;
@@ -258,11 +260,24 @@ static double qexp_memo(const Lay *L, double x)
     return q;
 }
 
+/* pricing 2: P(X >= 1) of a copy with x planned rows per replay */
+static double act_of(const Lay *L, double x)
+{
+    if (L->act_k > 0.0)
+        return 1.0 - det_exp(-L->act_k * det_log(1.0 + x / L->act_k));
+    return 1.0 - det_exp(-x);
+}
+
 static double fq(const Lay *L, double x, double *q)
 {
     if (!(x > 0.0)) {
         *q = 0.0;
         return 0.0;
+    }
+    if (L->pricing == 2) {
+        double qe = qexp_memo(L, x), a = act_of(L, x);
+        *q = qe;
+        return L->cf * a + L->act_var * (a * (1.0 - a)) + L->cl * (qe - 1.0) + L->cc * x;
     }
     double qq = L->pricing ? qexp_memo(L, x) : ceil(tiles(L, x + delta_of(L, x)));
     *q = qq;
@@ -976,9 +991,11 @@ static int check_par(const double *par)
         return 0;
     if (par[7] > MAX_INT_PAR || par[8] > MAX_INT_PAR || par[9] > MAX_INT_PAR || par[11] > MAX_INT_PAR || par[13] > MAX_INT_PAR)
         return 0;
-    if (!(par[14] == 0.0 || par[14] == 1.0))
+    if (!(par[14] == 0.0 || par[14] == 1.0 || par[14] == 2.0))
         return 0;
-    if (par[14] == 1.0 && !(par[15] > 0.0 && par[15] <= DISP_MAX))
+    if (par[14] >= 1.0 && !(par[15] > 0.0 && par[15] <= DISP_MAX))
+        return 0;
+    if (par[14] == 2.0 && !(par[16] >= 0.0 && par[16] <= ACT_K_MAX && par[17] >= 0.0))
         return 0;
     return 1;
 }
@@ -1032,8 +1049,10 @@ int l3b_weights(int E, int R, int LS, const double *load, const int *phys, const
     L->polish_iters = (int)par[8];
     L->tol = par[12];
     L->top = (int)par[13];
-    L->pricing = (par[14] == 1.0) ? 1 : 0;
+    L->pricing = (par[14] == 2.0) ? 2 : ((par[14] == 1.0) ? 1 : 0);
     L->disp = par[15];
+    L->act_k = par[16];
+    L->act_var = par[17];
     if (L->pricing) {
         ALLOC(L->qc_x, QCACHE);
         ALLOC(L->qc_q, QCACHE);

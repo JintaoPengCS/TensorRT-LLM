@@ -49,6 +49,89 @@ T_FORMS = (
 )  # the gate's rows-model forms; every other dict with cf.. is B
 B_KEYS = ("cf", "cl", "cc", "ch", "tau", "tau_hard", "tile_rows")
 
+# ================================================================================================ P5: prior v2
+# Calibrated rows per EP (the slot geometry is part of the key: EP16 = 28 slots / rank, EP32 = 16) and per T tier, with ONE
+# tier rule for the coefficients and the pricing (the largest tier <= T; below the smallest, the smallest, flagged
+# extrapolated), plus the activity model of the eF objective (placement_ef.py).  Used only with TLLM_GENEPLB_OBJECTIVE=ef.
+PRIOR_V2_FILE = Path(__file__).resolve().parent / "data" / "costmodel_b_prior_v2.json"
+PARAMS_SCHEMA_EF = "geneplb_costmodel_ef_params_v1"
+EF_DEFAULTS = dict(
+    act_k=8.0,  # NB shape of a copy's rows per replay
+    act_lam0=0.1,  # rows / replay added to every expert's window rate (regression to the mean; zero-load homes)
+    tile_disp=4.0,  # normal variance / mean of a copy's rows (later-tile pricing, as the shipped poisson presets)
+    gate_margin_us=0.5,  # a split / plan must beat the identity (home-only) routing by this (us per layer-step)
+    per_rank=2.0,  # placement flex: options (replicas) per home rank
+    keep_bonus=0.25,  # placement flex: hysteresis of a held replica's expert
+    place_min_gain_us=0.05,  # placement greedy: the smallest move kept
+    new_penalty_us=0.5,  # placement greedy: a new replica must beat a held one by this
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _prior_v2_raw() -> bytes:
+    return PRIOR_V2_FILE.read_bytes()
+
+
+def tier_v2(T: int, keys) -> int:
+    """ONE tier rule for the coefficients AND the pricing: the largest measured tier <= T, else the smallest."""
+    return max([k for k in keys if k <= T] or [min(keys)])
+
+
+def params_ef(T: int, ranks: int, local_slots: int) -> dict:
+    """The eF model of T tokens per rank (the balancer's T) at EP ``ranks`` with ``local_slots`` slots per rank: the prior v2
+    row (sealed params dict).  Raises when the file has no row set for this EP / slot geometry (never a silent EP32 row at
+    EP16, the shipped prior's flaw)."""
+    raw = _prior_v2_raw()
+    table = json.loads(raw)
+    sec = table.get("ep%d" % int(ranks))
+    if sec is None:
+        raise ValueError("costmodel_b_prior_v2.json: no rows for EP%d" % int(ranks))
+    if int(sec["local_slots"]) != int(local_slots):
+        raise ValueError(
+            "costmodel_b_prior_v2.json: EP%d rows are for %s slots per rank, the layer has %d"
+            % (int(ranks), sec["local_slots"], int(local_slots))
+        )
+    keys = sorted(int(k) for k in sec["rows"])
+    tier = tier_v2(int(T), keys)
+    e = sec["rows"][str(tier)]
+    out = dict(
+        schema=PARAMS_SCHEMA_EF,
+        source="prior_v2",
+        prior_sha256=hashlib.sha256(raw).hexdigest(),
+        form="eF",
+        ranks=int(ranks),
+        local_slots=int(local_slots),
+        T=int(T),
+        tier=int(tier),
+        tile_rows=TILE_ROWS,
+        rmse_us=e.get("rmse_us"),
+        extrapolated=int(T) < keys[0],
+    )
+    out.update({k: float(e[k]) for k in ("cf", "cl", "cc", "ch", "a")})
+    dflt = table.get("defaults", {})
+    out.update({k: float(e.get(k, sec.get(k, dflt.get(k, v)))) for k, v in EF_DEFAULTS.items()})
+    return sealed(out)
+
+
+def l3b_params_ef(p: dict, tau: float) -> dict:
+    """The B solver's parameters for pricing 2 (l3b_core.c, P5): the calibrated row, the layer's tau (> TAU_HARD, so the LSE
+    polish runs) and act_var = cf^2 / (2 tau) (the Gaussian bound's variance term)."""
+    tau = max(float(tau), 2.0 * TAU_HARD)
+    return dict(
+        cf=float(p["cf"]),
+        cl=float(p["cl"]),
+        cc=float(p["cc"]),
+        ch=float(p["ch"]),
+        tau=tau,
+        tile=float(p["tile_rows"]),
+        margin=1.5,
+        polish_iters=float(POLISH_ITERS),
+        pricing=2.0,
+        disp=float(p["tile_disp"]),
+        act_k=float(p["act_k"]),
+        act_var=float(p["cf"]) ** 2 / (2.0 * tau),
+    )
+
 
 # ================================================================================================ settings / prior
 

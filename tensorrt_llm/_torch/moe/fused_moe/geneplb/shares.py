@@ -49,6 +49,10 @@ PAR_NAMES = (
     "lse_top",
     "pricing",
     "disp",
+    "act_k",  # P5 pricing 2 (eF): NB shape of a copy's rows per replay (0 = Poisson)
+    "act_var",  # P5 pricing 2: the variance weight cf^2 / (2 tau)
+    "par18",
+    "par19",
 )
 PAR_DEFAULTS = dict(
     margin=0.0,
@@ -58,6 +62,10 @@ PAR_DEFAULTS = dict(
     lse_top=8.0,
     pricing=0.0,
     disp=0.0,
+    act_k=0.0,
+    act_var=0.0,
+    par18=0.0,
+    par19=0.0,
 )
 DIAG_NAMES = (
     "J",
