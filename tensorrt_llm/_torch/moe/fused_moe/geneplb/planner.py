@@ -414,6 +414,223 @@ def _ctl_admit(ctl: dict, layer, plan: dict, gain_ms: float, hyst_next: dict, di
     return False
 
 
+# ================================================================================================ movement-aware placement (move)
+# Movement-aware placement (placement_move.py), switched by the control file (balancer.py CTL_SPEC move /
+# move_tol_us; absent or move=0: every decision is the default one bit for bit; 'go2' in names and the move note = that default
+# decision). For every layer whose default layout (the placement rule
+# + sticky_layout) differs from the current one, _move_pick builds the keep-first layout (the current replicas of experts
+# that still need replicas are kept, only the rest is copied, into FREE slots) and prefers it when it copies fewer replicas
+# and its J -- the gate's own model and shares (layer_us / solve_weights: shipped B, form T, or eF) -- is within move_tol_us
+# of the default layout's. The gate charges the chosen layout the copies it makes (placement_move.copy_price: c_gpu_ms scaled by
+# the replicas the layer copies against the replicas per layer the copy-time history stands for, move_nref; the fabric
+# transport's per-row price when that transport is agreed) instead of a whole layer's c_gpu_ms. move=1 installs a layer only
+# when the default gate passes the default layout (never more often than move=0 on the same state: the gate's payback horizon is long
+# for live serving, so cheaper installs admitted more of them in simulation); move=2 gates every candidate on its own
+# copies alone. Rank-deterministic: every order is by index, no set / dict-order dependence.
+_PM = None
+
+
+def _pm():
+    global _PM
+    if _PM is None:
+        try:
+            from . import placement_move as pm
+        except ImportError:  # imported standalone by the planner worker
+            import placement_move as pm
+        _PM = pm
+    return _PM
+
+
+def move_nref(hist, geo: Geometry) -> float:
+    """(balancer) The replicas per layer the copy-time history stands for (its median; the startup probe's when empty)."""
+    return _pm().nref(hist, geo.ranks, geo.homes, geo.local_slots)
+
+
+def move_nhist_push(hist, installs, c_gpu_ms, budget_ms, per_step, geo: Geometry) -> list:
+    """(balancer) The history after a decision's installs (placement_move.nhist_push)."""
+    return _pm().nhist_push(hist, installs, c_gpu_ms, budget_ms, per_step, geo.ranks, geo.homes, geo.local_slots)
+
+
+def move_note(diag) -> str:
+    """(balancer) The renewal line's '; move ...' note ('' unless the decision ran with move>=1)."""
+    return _pm().note(diag)
+
+
+def _move_rank_cost(model, cbar, geo: Geometry, efm):
+    """rank_cost(layout, r) for placement_move.keep_first: rank r's cost under the gate's model (efm = (eF model, rates, tau)
+    when the eF objective prices the layer, else B's rank cost or the rows form) with the layout's even split."""
+    M = geo.local_slots
+
+    def copies(layout):
+        k = {}
+        for e in layout:
+            if e >= 0:
+                k[e] = k.get(e, 0) + 1
+        return k
+
+    if efm is not None:
+        m, rates, tau = efm
+
+        def cost(layout, r):
+            k = copies(layout)
+            st = placement_ef.State(m, 1)
+            for j in range(M):
+                e = layout[r * M + j]
+                if e >= 0:
+                    st.add(0, placement_ef.slot_terms(m, rates[e], 1.0 / k[e]))
+            return st.u(0, tau)
+
+        return cost
+    if costmodel.is_b(model):
+        t, cf, cl, cc, ch = (float(model[x]) for x in ("tile_rows", "cf", "cl", "cc", "ch"))
+
+        def cost(layout, r):  # costmodel.rank_costs_B of one rank
+            k = copies(layout)
+            F = Lt = hot = 0
+            rows = 0.0
+            for j in range(M):
+                e = layout[r * M + j]
+                if e >= 0:
+                    x = float(cbar[e]) / k[e]
+                    if x > 0:
+                        q = math.ceil(x / t)
+                        F += 1
+                        Lt += q - 1
+                        rows += x
+                        hot = max(hot, q)
+            return cf * F + cl * Lt + cc * rows + ch * max(hot - 1, 0)
+
+        return cost
+    f, t, tw, mm, beta = model["form"], model["slope_us"], model["tau_w_us"], model["m"], model["beta_us"]
+
+    def cost(layout, r):  # costmodel._rank_cost_T of one rank (the rows forms L / T / RT / ET)
+        k = copies(layout)
+        xs = [float(cbar[e]) / k[e] for e in layout[r * M:(r + 1) * M] if e >= 0]
+        if f == "L":
+            c = t * sum(xs)
+        else:
+            kp = [math.ceil(x / mm) * mm for x in xs]
+            if f == "T":
+                c = t * sum(kp)
+            elif f == "RT":
+                c = max(sum(1 for x in xs if x > 0) * tw, t * sum(kp))
+            else:
+                c = sum(max(tw, t * q) for x, q in zip(xs, kp) if x > 0)
+        return c + (beta * sum(xs) if beta else 0.0)
+
+    return cost
+
+
+def _move_layout(req, layer, geo: Geometry, totals, cbar, cur, plan, model):
+    """The keep-first layout of one layer under the placement rule that made ``plan`` -> (layout, copies), or None for the
+    experimental greedy placement (its plan already prices held replicas: move is inert there)."""
+    pm = _pm()
+    E, R, H, M = geo.experts, geo.ranks, geo.homes, geo.local_slots
+    efm = None
+    if _objective() == "ef" and costmodel.is_b(model) and "T" in model:  # the eF objective prices this layer (layer_us)
+        m = placement_ef.Model.from_params(_ef_params(model, geo), R)
+        efm = (m, [float(x) for x in cbar], placement_ef.identity_tau(m, [float(x) for x in cbar], R, H))
+    cost = _move_rank_cost(model, cbar, geo, efm)
+    if _placement() != "lpt" and _EF.get("totals") is totals:  # P6: the plan came from _fixedhome_targets_ef
+        if _placement() != "flex":
+            return None
+        ctx = _EF
+        need = {e: len(rs) for e, rs in sorted(plan.items())}
+        u = pm.flex_u(ctx["model"], ctx["rates"], R, H)
+        cf, rates = ctx["model"].cf, ctx["rates"]
+
+        def place(lay, rem, free):
+            return pm.place_flex(lay, rem, free, u, cf, R, H, M)
+
+        def prio(e):
+            return -rates[e]
+    else:  # rows-LPT: fixedhome_targets' counts and replica sizes
+        load = [_f32(float(x)) for x in totals]
+        counts = do_replication(load, req["total_active"], E)
+        need = {e: counts[e] - 1 for e in range(E) if counts[e] > 1}
+        size = [load[e] / counts[e] for e in range(E)]
+
+        def place(lay, rem, free):
+            return pm.place_lpt(lay, rem, free, size, R, H, M)
+
+        def prio(e):
+            return -size[e]
+    new, copies, _ = pm.keep_first(cur, need, R, H, M, req["retired"].get(layer, ()), cost, prio, place)
+    return new, copies
+
+
+def _move_pick(req, ctl, layer, geo: Geometry, lmode, model, totals, scale, cbar, cur, w_cur, plan, new, copies, w_new,
+               gain_ms, n_rem, diag):
+    """The layout this layer's gate tests and the price the gate charges it: -> (plan, layout, copies,
+    weights, gain_ms, price_ms). Keep-first is a candidate when it copies fewer replicas than the default layout (plan / new /
+    copies); it is preferred when its J is within move_tol_us (us per layer-step) of the default layout's. Its price is that of
+    the copies it makes (placement_move.copy_price on NCCL / CE; with the fabric transport agreed,
+    the fabric gate's per-row price of its busiest destination, the price that gate line applies).
+      move=1 (default admission): a layer installs only when the default gate passes the default layout (its own price, margin), so move
+             never installs more often than move=0 on the same state; keep-first then replaces the default layout when preferred and
+             when it pays for its own copies (else nothing installs: the default layout gains <= move_tol_us more than a
+             keep-first layout that does not pay for its copies).
+      move=2 (per-copy admission): every candidate is gated on its own copies; keep-first when preferred, or when only it
+             pays for its copies."""
+    pm = _pm()
+    R, H, M = geo.ranks, geo.homes, geo.local_slots
+    mode = int(ctl.get("move") or 0)
+    tol = ctl.get("move_tol_us")
+    tol = pm.MOVE_TOL_US if tol is None else float(tol)
+    ref = ctl.get("move_nref")
+    ref = pm.probe_copies(R, H, M) if ref is None else float(ref)
+    c_base = req["c_gpu_ms"] or 0.0
+    c_row = req.get("c_row_ms")  # the fabric transport's per-row price; None: NCCL / CE
+    margin = float(ctl.get("gate_margin_us") or 0.0)
+    for k in ("mv_eval", "mv_k", "mv_same", "mv_cp", "mv_cp_u", "mv_go2"):
+        diag.setdefault(k, 0)
+    for k in ("mv_dj", "mv_djk", "mv_djmax"):
+        diag.setdefault(k, 0.0)
+    diag["mv_tol"], diag["mv_nref"], diag["mv_mode"] = tol, ref, mode
+
+    def price(cps):
+        if c_row is not None:
+            return float(c_row) * int(req.get("planes") or 7) * pm.max_dest(cps, M)
+        return pm.copy_price(c_base, len(cps), ref)
+
+    def passes(g, p):
+        return g * n_rem > p and not (margin > 0.0 and not g * 1e3 > margin)
+
+    price_go2 = c_base if c_row is None else price(copies)  # what the default gate line charges the default layout
+    go2_ok = passes(gain_ms, price_go2)
+    diag["mv_eval"] += 1
+    diag["mv_cp_u"] += len(copies)
+    diag["mv_go2"] += int(go2_ok)
+    if mode == 1:
+        pick = (plan, new, copies, w_new, gain_ms, price_go2)
+    else:
+        pick = (plan, new, copies, w_new, gain_ms, price(copies))
+    kf = None if (mode == 1 and not go2_ok) else _move_layout(req, layer, geo, totals, cbar, cur, plan, model)
+    if kf is not None and kf[0] == new:
+        diag["mv_same"] += 1
+    elif kf is not None and len(kf[1]) < len(copies):
+        new_k, copies_k = kf
+        w_k = solve_weights(lmode, totals, scale, new_k, geo, req["b_params"])
+        j_cur = layer_us(model, cbar, cur, w_cur, geo)
+        j_u = layer_us(model, cbar, new, w_new, geo)
+        j_k = layer_us(model, cbar, new_k, w_k, geo)
+        gain_k = (j_cur - j_k) / 1e3
+        p_k = price(copies_k)
+        diag["mv_dj"] += j_k - j_u
+        within = j_k <= j_u + tol
+        if mode == 1:
+            take = within  # the default passed its own layout; keep-first replaces it (installed only if it pays for its copies)
+        else:
+            take = within or (passes(gain_k, p_k) and not passes(gain_ms, pick[5]))
+        if take:
+            pick = (pm.plan_of(new_k, R, H, M), new_k, copies_k, w_k, gain_k, p_k)
+            diag["mv_k"] += 1
+            diag["mv_djk"] += j_k - j_u  # the chosen keep-first layouts' predicted excess over the default (us per layer-step)
+            diag["mv_djmax"] = max(diag["mv_djmax"], j_k - j_u)
+    diag["mv_cp"] += len(pick[2])
+    return pick
+
+
 def decide(req: dict) -> dict:
     """_decide() under the request's objective / placement (_run_controls; without them the env values),
     set for this decision only."""
@@ -479,6 +696,11 @@ def _decide(req: dict) -> dict:
         gain_ms = (
             layer_us(model, cbar, cur, w_cur, geo) - layer_us(model, cbar, new, w_new, geo)
         ) / 1e3
+        if ctl is not None and ctl.get("move"):  # keep-first vs this layout; the gate prices the copies made
+            plan, new, copies, w_new, gain_ms, c_gpu = _move_pick(
+                req, ctl, layer, geo, lmode, model, totals, scale, cbar, cur, w_cur, plan, new, copies, w_new, gain_ms,
+                n_rem, diag,
+            )
         if ctl is not None:
             diag["n_eval"] += 1
             diag["cur_new"] += gain_ms * 1e3

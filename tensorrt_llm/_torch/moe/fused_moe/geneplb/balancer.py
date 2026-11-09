@@ -97,6 +97,12 @@ CTL_SPEC = (
     # the planner worker uses them instead of TLLM_GENEPLB_OBJECTIVE / TLLM_GENEPLB_PLACEMENT (planner.py _run_controls);
     # placement=flex is inert (lpt) unless objective=ef and pad=drop. Cost model B only (mode C ignores both).
     ("objective", {"shipped": 0, "ef": 1}, 0),  # shipped cost model B on the window means | P5 eF (expected-max) objective
+    # movement-aware placement (planner._move_pick, placement_move.py): keep the current
+    # replicas the decided counts still need and copy only the rest when that layout's J is within move_tol_us (us per
+    # layer-step; 'default' = placement_move.MOVE_TOL_US) of the default (move=0) layout's; the gate prices the replicas actually copied.
+    # move=1: a layer installs only when the default gate passes the default layout; move=2: per-copy admission (more installs).
+    ("move", {"0": 0, "1": 1, "2": 2}, 0),  # 0 default | 1 keep-first, default admission | 2 keep-first, per-copy admission
+    ("move_tol_us", float, -1),
     ("placement", {"lpt": 0, "flex": 1}, 0),  # shipped rows-LPT | P6 flex options (every rank's 2 busiest homes)
     # the source of cost model B's parameters (share solver, install gate, P5's kernel
     # terms) from the next renewal on: prior (the shipped prior_params) | prior_v2 (prior v2's kernel terms of the geometry)
@@ -134,7 +140,8 @@ def parse_ctl(text: str):
             try:
                 if isinstance(kind, dict):
                     code = float(kind[value])
-                elif (key, value) in (("gate_horizon", "fixed"), ("gate_tau", "prior"), ("min_t", "default")):
+                elif (key, value) in (("gate_horizon", "fixed"), ("gate_tau", "prior"), ("min_t", "default"),
+                                      ("move_tol_us", "default")):
                     code = -1.0
                 else:
                     code = float(kind(value))
@@ -160,6 +167,8 @@ def ctl_fields(codes) -> dict:
         gate_margin_us=max(0.0, c["gate_margin_us"]),
         gate_hyst=max(1, int(c["gate_hyst"])),
         gate_horizon=None if c["gate_horizon"] < 1 else int(c["gate_horizon"]),
+        move=min(2, max(0, int(c["move"]))),
+        move_tol_us=None if c["move_tol_us"] < 0 else c["move_tol_us"],  # None: placement_move.MOVE_TOL_US
         copy="fabric" if c["copy"] >= 1 else "nccl",
         objective="ef" if c["objective"] >= 1 else "shipped",
         placement="flex" if c["placement"] >= 1 else "lpt",
@@ -173,6 +182,7 @@ def ctl_text(f: dict) -> str:
         f"install={f['install']} min_t={f['min_t']} guard_t={f['guard_t']} pad={f['pad']} identity={f['identity']} "
         f"gate_tau={'prior' if f['gate_tau'] is None else repr(f['gate_tau'])} gate_margin_us={f['gate_margin_us']!r} "
         f"gate_hyst={f['gate_hyst']} gate_horizon={'fixed' if f['gate_horizon'] is None else f['gate_horizon']} "
+        f"move={f['move']} move_tol_us={'default' if f['move_tol_us'] is None else repr(f['move_tol_us'])} "
         f"copy={f['copy']} objective={f['objective']} placement={f['placement']} "
         f"params={'default' if f['params'] is None else f['params']}"
     )
@@ -562,6 +572,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self._ctl_word, self._ctl_word_next, self._drop_words, self._drop_next = 0, 0, False, False
         self.window_prows = 0
         self._hyst = {}
+        self._move_nhist = {}  # transport -> replicas per layer of the installs behind its copy-time history
         self._snap_nan = torch.zeros(1, dtype=torch.int32, pin_memory=prefer_pinned()) if NANPROBE else None
 
     def begin_step(self, scheduled_requests, draft_len: int, graph: bool, is_dummy: bool) -> None:
@@ -886,6 +897,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                             objective=ctl["objective"],  # (p56ctl) the planner's run-time P5 / P6 switch
                             placement=ctl["placement"],
                             pad=ctl["pad"],  # placement=flex is inert unless pad=drop
+                            move=ctl["move"],  # keep-first placement, its J tolerance and the replicas
+                            move_tol_us=ctl["move_tol_us"],  # per layer the copy-time history stands for
+                            move_nref=planner.move_nref(self._move_nhist.get(self._copy_mode), self.geo),
                         )
                     )
                 ),
@@ -906,6 +920,11 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
 
         for ins in reply["installs"]:
             self.installed_at[ins["layer"]] = self.decisions
+        if CTL_FILE and reply["installs"]:  # the replicas per layer its measured copy time will stand for
+            self._move_nhist[self._copy_mode] = planner.move_nhist_push(
+                self._move_nhist.get(self._copy_mode), reply["installs"], self.c_gpu_ms, COPY_BUDGET_MS,
+                LAYERS_PER_COPY_STEP, self.geo,
+            )
         c = self.c_gpu_ms
         chunk = (
             max(1, min(LAYERS_PER_COPY_STEP, int(COPY_BUDGET_MS / c)))
@@ -1014,7 +1033,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             f"{d.get('n_copy', 0)} pass copy, {d.get('n_margin', 0)} margin-rej, {d.get('n_hyst', 0)} hyst-wait), "
             f"cur-id {d.get('cur_id', 0.0):.2f}, J_cur {d.get('j_cur', 0.0):.1f}; word {self._ctl_word_next}; "
             f"nan {ctl['nan']}"
-        )
+        ) + planner.move_note(d)  # '' unless the decision ran with move>=1
 
     def _ctl_status(self, status: str) -> None:
         """<CTL_FILE>.rank<r>: the control this rank applies (rewritten on a change: tmp + rename)."""
