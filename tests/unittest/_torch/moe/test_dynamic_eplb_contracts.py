@@ -1986,6 +1986,7 @@ def _autotune_helpers(torch):
         "validate_megamoe_tactic",
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
+        "_with_atomic_counter_work_ids",
         "enumerate_megamoe_candidate_tactics",
     }
     constants = {
@@ -2135,6 +2136,23 @@ def test_on_autotune_uses_distinct_tactics():
         "token_tile",
     }
     assert any(tactic[2] is not None for tactic in on)
+
+    # Blackwell keeps its OFF candidates (with atomic-counter work ids under load balancing) and gains the same
+    # legal token-tile bases.
+    unpack = helpers["_unpack_tactic"]
+    enumerate_tactics = helpers["enumerate_megamoe_candidate_tactics"]
+    atomic_counter = helpers["_with_atomic_counter_work_ids"]
+    for sm_version in (100, 103):
+        for num_tokens in (32, 8192, 16384):
+            blackwell_off = enumerate_tactics(num_tokens, sm_version)
+            blackwell_on = enumerate_tactics(num_tokens, sm_version, load_balance=True)
+            assert all(unpack(tactic)[10] == "expert" for tactic in blackwell_off)
+            assert {repr(unpack(tactic)) for tactic in atomic_counter(blackwell_off)} <= {
+                repr(unpack(tactic)) for tactic in blackwell_on
+            }
+            token_tile = [tactic for tactic in blackwell_on if unpack(tactic)[10] == "token_tile"]
+            assert len(token_tile) == 4
+            assert any(tactic[2] is not None for tactic in token_tile)
 
 
 def test_on_autotune_builds_balanced_powerlaw_input(request):
