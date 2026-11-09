@@ -153,6 +153,20 @@ PROBE_LAYERS = 2
 # included): copy cost is only re-measured by a published install, so a single outlier copy must not price every
 # later install out (a last-value estimate froze installs for good after one 36 ms/layer copy).
 COPY_HISTORY = 9
+# Replica copy transport. TLLM_GENEPLB_COPY = nccl (default: the shipped NCCL
+# batch_isend_irecv) | ce (copy-engine pull through a symmetric staging buffer, fastcopy.py; no NCCL P2P
+# pre-connect) | both (both armed, NCCL agreed at start). With both armed, a 'copy=ce|nccl' field in
+# TLLM_GENEPLB_CTL_FILE is this rank's request: every renewal's ready vote carries it (MAX over ranks: CE wins)
+# and the agreed transport prices the gate and copies from the next renewal on, the same on every rank.
+# TLLM_GENEPLB_COPY_BUDGET_MS overrides COPY_BUDGET_MS (the copy time one replay may absorb).
+COPY_NCCL, COPY_CE = 0, 1
+COPY_MODE_NAMES = ("nccl", "ce")
+COPY_ARMED = {"nccl": ((COPY_NCCL,), COPY_NCCL), "ce": ((COPY_CE,), COPY_CE), "both": ((COPY_NCCL, COPY_CE), COPY_NCCL)}
+COPY_ARM = os.environ.get("TLLM_GENEPLB_COPY", "nccl").strip().lower()
+if COPY_ARM not in COPY_ARMED:
+    raise ValueError(f"TLLM_GENEPLB_COPY={COPY_ARM!r}: one of {sorted(COPY_ARMED)}")
+COPY_CTL_FILE = os.environ.get("TLLM_GENEPLB_CTL_FILE", "")
+COPY_BUDGET_MS = float(os.environ.get("TLLM_GENEPLB_COPY_BUDGET_MS", COPY_BUDGET_MS))
 
 
 class GenEplbLayer:
@@ -409,6 +423,13 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.renewals = self.install_count = 0
         self.c_gpu_ms = None
         self.copy_ms_history = []  # measured copy ms/layer (max over ranks), newest last
+        # Copy transport: the armed ones (same env on every rank), the agreed one (prices the gate, copies the next
+        # install), one measured-copy history per transport, this rank's CTL request, the CE copier.
+        self._copy_armed, self._copy_mode = COPY_ARMED[COPY_ARM]
+        self._copy_default = self._copy_mode
+        self._copy_hist = {COPY_NCCL: self.copy_ms_history}
+        self._copy_ctl = (None, self._copy_mode)  # (CTL file mtime, requested transport)
+        self._ce = None  # fastcopy.CeCopier, armed in after_warmup
         self.connected = False
         # No replica held and the last gate admitted none (set by each renewal).
         self.dormant = False
@@ -511,8 +532,10 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             if plans:
                 first = int(out[0]) + INSTALL_MARGIN
                 self.installs.append(
-                    dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk)
+                    dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk,
+                         copy=self._copy_mode)
                 )
+            self._set_copy_mode(int(out[5]))  # the agreed request (MAX over ranks), from the next renewal on
         self._poll_installs()
 
     def route(self, layer: GenEplbLayer, ids: torch.Tensor) -> torch.Tensor:
@@ -753,8 +776,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         key = hashlib.blake2b(repr((self.decisions, chunk, plan)).encode(), digest_size=8).digest()
         digest = float(int.from_bytes(key, "little") >> 12)  # 52 bits: exact in a float64
         d = float(self.decisions)
-        vote = np.array([float(self.forwards), d, digest, -d, -digest])
-        out = np.empty(5, dtype=np.float64)
+        vote = np.array([float(self.forwards), d, digest, -d, -digest, float(self._copy_request())])
+        out = np.empty(6, dtype=np.float64)
         self.ready_vote = (
             self.comm_ready.Iallreduce(vote, out, op=MPI.MAX),
             (vote, out),
@@ -885,11 +908,16 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 )
             k = ins["issued"]
             plans = ins["plans"][k * ins["chunk"] : (k + 1) * ins["chunk"]]
-            ins["events"].append((*self._copy_layers(plans), len(plans)))
+            ins["events"].append((*self._copy_layers(plans, ins.get("copy", COPY_NCCL)), len(plans)))
             ins["issued"] += 1
 
-    def _copy_layers(self, plans):
+    def _copy_layers(self, plans, mode=COPY_NCCL):
         """Copy the plans' replicas from their home slots, on the current stream: (start, done) timing events."""
+        if mode == COPY_CE:
+            if self._ce is None:
+                self._arm_ce()  # collective; only if after_warmup did not run (every rank is at this agreed step)
+            if self._ce is not None:
+                return self._ce.copy(plans)  # copy-engine pull through the symmetric staging buffer
         import torch.distributed as dist
 
         M = self.geo.local_slots
@@ -945,11 +973,13 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.connected = True
         R, r = self.ep_size, self.ep_rank
         torch.cuda.synchronize()
+        if COPY_CE in self._copy_armed and self._ce is None:
+            self._arm_ce()  # symmetric staging buffer (collective); NCCL on every rank if any rank fails
         t0 = time.perf_counter()
         send = torch.zeros(CONNECT_BYTES, dtype=torch.uint8, device=self.device)
         recv = torch.empty((R, CONNECT_BYTES), dtype=torch.uint8, device=self.device)
         free0 = torch.cuda.mem_get_info(self.device)[0]
-        peers = [p for p in range(R) if p != r]
+        peers = [p for p in range(R) if p != r] if COPY_NCCL in self._copy_armed else []
         ops = [dist.P2POp(dist.isend, send, p, group=self.copy_group) for p in peers]
         ops += [dist.P2POp(dist.irecv, recv[p], p, group=self.copy_group) for p in peers]
         for w in dist.batch_isend_irecv(ops) if ops else []:
@@ -972,19 +1002,82 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             )
             for li in range(min(PROBE_LAYERS, self.num_layers))
         ]
-        for _ in range(2):  # the second, warm copy prices installs (the first pays one-time setup)
-            start, done = self._copy_layers(plans)
-            done.synchronize()
-        probe_ms = start.elapsed_time(done) / len(plans)
-        connect_s, nccl_mb, self.c_gpu_ms = (
-            self.comm_done.allreduce(v, op=MPI.MAX) for v in (connect_s, nccl_mb, probe_ms)
+        probe = {}
+        for mode in self._copy_armed:  # one startup price per armed transport
+            for _ in range(2):  # the second, warm copy prices installs (the first pays one-time setup)
+                start, done = self._copy_layers(plans, mode)
+                done.synchronize()
+            probe[mode] = start.elapsed_time(done) / len(plans)
+        connect_s, nccl_mb, *probe_max = (
+            self.comm_done.allreduce(v, op=MPI.MAX) for v in (connect_s, nccl_mb, *probe.values())
         )
-        self.copy_ms_history = [self.c_gpu_ms]
+        for mode, ms in zip(probe, probe_max):
+            self._copy_hist[mode] = [ms]
+        self._set_copy_mode(self._copy_mode)
         if r == 0:
             logger.info(
                 f"GenEPLB connected {R - 1} peers in {connect_s:.2f} s (NCCL buffers {nccl_mb:.0f} MB, max over "
                 f"ranks); startup copy probe {len(plans)} layers x {n} replicas/rank: c_gpu_ms {self.c_gpu_ms:.3f}"
+                + ("" if self._copy_armed == (COPY_NCCL,) else
+                   f"; copy transports {', '.join(f'{COPY_MODE_NAMES[m]} {p:.3f}' for m, p in zip(probe, probe_max))} "
+                   f"ms/layer, agreed {COPY_MODE_NAMES[self._copy_mode]}; CE {self._ce.describe() if self._ce else 'off'}")
             )
+
+    def _set_copy_mode(self, mode: int) -> None:
+        """Make ``mode`` the agreed transport: the median of its measured copies prices the gate."""
+        self._copy_mode = mode if mode in self._copy_armed else self._copy_armed[0]
+        self.copy_ms_history = self._copy_hist.setdefault(self._copy_mode, [])
+        if self.copy_ms_history:
+            self.c_gpu_ms = float(np.median(self.copy_ms_history))
+
+    def _copy_request(self) -> int:
+        """This rank's transport request for the next vote: with both transports armed, the 'copy=' field of the
+        CTL file (re-read on mtime change; no field: the startup default), else the agreed transport."""
+        if len(self._copy_armed) < 2 or not COPY_CTL_FILE:
+            return self._copy_mode
+        try:
+            mtime = os.stat(COPY_CTL_FILE).st_mtime
+            if mtime != self._copy_ctl[0]:
+                from .fastcopy import parse_copy_field
+
+                with open(COPY_CTL_FILE) as f:
+                    want = parse_copy_field(f.read())
+                self._copy_ctl = (mtime, COPY_MODE_NAMES.index(want) if want else self._copy_default)
+        except OSError:
+            pass
+        return self._copy_ctl[1] if self._copy_ctl[1] in self._copy_armed else self._copy_mode
+
+    def _arm_ce(self) -> None:
+        """Copy-engine transport (fastcopy.py): each rank allocates its symmetric staging buffer, then all
+        rendezvous on the copy group. Collective; if any rank fails, every rank keeps NCCL copies."""
+        from mpi4py import MPI
+
+        ce, err = None, None
+        try:
+            from . import fastcopy
+
+            geo = self.geo
+            ce = fastcopy.CeCopier(
+                self.slot_tensors, home_slot=geo.home_slot, local_slots=geo.local_slots, ranks=self.ep_size,
+                rank=self.ep_rank, group=self.copy_group, device=self.device,
+            )
+        except Exception as e:  # any local failure: the ranks agree on NCCL below
+            ce, err = None, e
+        item = ce.item if ce is not None else -1
+        mine = np.array([int(ce is not None), item, -item], dtype=np.int64)
+        agreed = np.empty_like(mine)
+        self.comm_done.Allreduce(mine, agreed, op=MPI.MIN)
+        if agreed[0] and agreed[1] == -agreed[2]:  # every rank allocated, one staging layout
+            try:
+                ce.connect()  # collective rendezvous: every peer's staging buffer mapped (fabric handles)
+            except Exception as e:
+                err = e
+            if self.comm_done.allreduce(int(err is None), op=MPI.MIN):
+                self._ce = ce
+                return
+        self._ce = None
+        self._copy_armed, self._copy_mode, self._copy_default = (COPY_NCCL,), COPY_NCCL, COPY_NCCL
+        logger.warning(f"GenEPLB rank {self.ep_rank}: copy-engine transport unavailable ({err!r}): NCCL copies")
 
     def _poll_installs(self) -> None:
         """Vote once this rank's copies of an install landed; publish once every rank's have. Never blocks: a
@@ -1017,14 +1110,16 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self._stage_layer(li, p["tables"])
         self.pending_writes = True
         copy_ms = float(ins["recv"][0])
-        self.copy_ms_history = (self.copy_ms_history + [copy_ms])[-COPY_HISTORY:]
-        self.c_gpu_ms = float(np.median(self.copy_ms_history))
+        mode = ins.get("copy", COPY_NCCL)
+        self._copy_hist[mode] = (self._copy_hist.get(mode, []) + [copy_ms])[-COPY_HISTORY:]
+        self._set_copy_mode(self._copy_mode)  # the gate prices the agreed transport's copies
         self.install_count += 1
         if self.ep_rank == 0:
             copies = sum(len(p["copies"]) for p in ins["plans"])
             logger.info(
                 f"GenEPLB install {self.install_count} @replay {self.replays}: {len(ins['plans'])} layers, "
-                f"{copies} replicas, copy {copy_ms:.3f} ms/layer (max over ranks), gate estimate {self.c_gpu_ms:.3f} "
+                f"{copies} replicas, copy {copy_ms:.3f} ms/layer{' (ce)' if mode == COPY_CE else ''} (max over ranks), "
+                f"gate estimate {self.c_gpu_ms:.3f} "
                 f"(median of {len(self.copy_ms_history)})"
             )
 
