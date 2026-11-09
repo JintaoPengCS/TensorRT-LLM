@@ -4631,10 +4631,21 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         self.setup_quant_scales(module)
         if arena is not None:
             self._bind_live_weight_planes(module, arena)
+        elif callable(getattr(layer_load_balancer, "fabric_arena", None)):
+            # GenEPLB's fabric arena (geneplb/fabric.py): one fabric allocation per
+            # plane spanning every GenEPLB layer, every peer's mapped; None unless TLLM_GENEPLB_FABRIC=1 and cost model
+            # B. Bound before any weight is loaded, like the HALO-Q arena above (loading writes straight into it).
+            fabric_arena = layer_load_balancer.fabric_arena(module, bundle)
+            if fabric_arena is not None:
+                self._bind_live_weight_planes(module, fabric_arena)
 
     def cache_derived_state(self, module: torch.nn.Module) -> None:
         super().cache_derived_state(module)
         layer_load_balancer = getattr(module, "layer_load_balancer", None)
+        fabric_arena = getattr(layer_load_balancer, "fabric_view", None)
+        if fabric_arena is not None:
+            # loading and transformation must leave the seven planes on GenEPLB's fabric arena
+            self.assert_live_weight_aliases(module, fabric_arena)
         if (layer_load_balancer is None
                 or not layer_load_balancer.produces_replica_plan):
             return

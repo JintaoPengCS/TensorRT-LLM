@@ -27,6 +27,7 @@ from tensorrt_llm.logger import logger
 
 from ..moe_load_balancer import BaseMoeLoadBalancer
 from . import costmodel, native, planner, shares
+from . import fabric as fx
 from .geometry import Geometry
 from .worker import Worker
 
@@ -71,6 +72,11 @@ LIVE_MIN_T = int(os.environ.get("TLLM_GENEPLB_LIVE_MIN_T", "32"))
 #     <CTL_FILE>.rank<r> on a change, and rank 0's renewal line carries them with the real / padded T and the gate's sums.
 #   TLLM_GENEPLB_NANPROBE=1 (with the control file): a captured count of non-finite router weights over every row (padding
 #     rows included) of every staged layer, summed over ranks in the renewal line and the status files.
+# TLLM_GENEPLB_FABRIC=1: the MegaMoE planes of every GenEPLB layer live in ONE fabric
+#     allocation per plane, every peer's mapped (fabric.py); TLLM_GENEPLB_COPY=fabric|both: single-hop copy-engine replica
+#     copies from the least loaded holder, issued at the rank's decision, no NCCL; copy=nccl stays the shipped reference.
+#     TLLM_GENEPLB_VERIFY_COPY=1: every copied row compared with the expert's home row (mismatches in the install / renewal
+#     lines and <CTL_FILE>.fabric.rank<r>); TLLM_GENEPLB_NSYS_INSTALL=k: cudaProfilerStart / Stop around the k-th install.
 FORCE_LIVE = os.environ.get("TLLM_GENEPLB_FORCE_LIVE", "0") == "1"
 CTL_FILE = os.environ.get("TLLM_GENEPLB_CTL_FILE", "")
 NANPROBE = bool(CTL_FILE) and os.environ.get("TLLM_GENEPLB_NANPROBE", "0") == "1"
@@ -86,7 +92,7 @@ CTL_SPEC = (
     ("gate_margin_us", float, 0),  # gain per layer-step required on top of the copy-basis test
     ("gate_hyst", int, 1),  # consecutive renewals a layer's plan (same digest) must pass before it installs
     ("gate_horizon", int, -1),  # the payback horizon in replays; 'fixed': the shipped one
-    ("copy", {"nccl": 0, "ce": 1}, 0),  # reserved for the copy prototype (this build copies with NCCL either way)
+    ("copy", {"nccl": 0, "fabric": 1}, 0),  # this rank's transport request, with TLLM_GENEPLB_COPY=both
     # The P5 / P6 policies at run time: the decide request carries them (with pad) and
     # the planner worker uses them instead of TLLM_GENEPLB_OBJECTIVE / TLLM_GENEPLB_PLACEMENT (planner.py _run_controls);
     # placement=flex is inert (lpt) unless objective=ef and pad=drop. Cost model B only (mode C ignores both).
@@ -138,7 +144,7 @@ def ctl_fields(codes) -> dict:
         gate_margin_us=max(0.0, c["gate_margin_us"]),
         gate_hyst=max(1, int(c["gate_hyst"])),
         gate_horizon=None if c["gate_horizon"] < 1 else int(c["gate_horizon"]),
-        copy="ce" if c["copy"] >= 1 else "nccl",
+        copy="fabric" if c["copy"] >= 1 else "nccl",
         objective="ef" if c["objective"] >= 1 else "shipped",
         placement="flex" if c["placement"] >= 1 else "lpt",
     )
@@ -166,12 +172,32 @@ COPY_HISTORY = 9
 # TLLM_GENEPLB_CTL_FILE is this rank's request: every renewal's ready vote carries it (MAX over ranks: CE wins)
 # and the agreed transport prices the gate and copies from the next renewal on, the same on every rank.
 # TLLM_GENEPLB_COPY_BUDGET_MS overrides COPY_BUDGET_MS (the copy time one replay may absorb).
-COPY_NCCL, COPY_CE = 0, 1
-COPY_MODE_NAMES = ("nccl", "ce")
-COPY_ARMED = {"nccl": ((COPY_NCCL,), COPY_NCCL), "ce": ((COPY_CE,), COPY_CE), "both": ((COPY_NCCL, COPY_CE), COPY_NCCL)}
+# copy=ce (the two-hop staging prototype, fastcopy.py) is withdrawn and refused. COPY_FABRIC: single-hop
+# copy-engine pulls from a holder's fabric-resident row straight into the destination slot (fabric.py; needs
+# TLLM_GENEPLB_FABRIC=1): no NCCL group, no NCCL pre-connect, no staging. copy=nccl stays the shipped reference.
+COPY_NCCL, COPY_FABRIC = 0, 1
+COPY_MODE_NAMES = ("nccl", "fabric")
+COPY_ARMED = {
+    "nccl": ((COPY_NCCL,), COPY_NCCL),
+    "fabric": ((COPY_FABRIC,), COPY_FABRIC),
+    "both": ((COPY_NCCL, COPY_FABRIC), COPY_NCCL),
+}
 COPY_ARM = os.environ.get("TLLM_GENEPLB_COPY", "nccl").strip().lower()
+if COPY_ARM == "ce":
+    raise ValueError("TLLM_GENEPLB_COPY=ce (two-hop staging copies) is withdrawn: use fabric (single-hop copy engine) or nccl")
 if COPY_ARM not in COPY_ARMED:
     raise ValueError(f"TLLM_GENEPLB_COPY={COPY_ARM!r}: one of {sorted(COPY_ARMED)}")
+
+
+def copy_field(text: str):
+    """The transport a control file asks for: its last 'copy=nccl|fabric' token, else None."""
+    want = None
+    for line in text.splitlines():
+        for tok in line.split("#", 1)[0].split():
+            key, sep, value = tok.partition("=")
+            if sep and key == "copy" and value in COPY_MODE_NAMES:
+                want = value
+    return want
 COPY_CTL_FILE = os.environ.get("TLLM_GENEPLB_CTL_FILE", "")
 COPY_BUDGET_MS = float(os.environ.get("TLLM_GENEPLB_COPY_BUDGET_MS", COPY_BUDGET_MS))
 
@@ -198,6 +224,13 @@ class GenEplbLayer:
         self.repeat_count = repeat_count
         self.moe = None
         self.initial_assignments = None
+        self.fabric_view = None  # this layer's fabric arena views, once bound
+
+    def fabric_arena(self, module, bundle):
+        """This layer's [M]-row views of the model's fabric arena for the quant method's create_weights
+        (quantization.py, after the HALO-Q arena hook), or None: TLLM_GENEPLB_FABRIC off or cost model C."""
+        self.fabric_view = self.owner.fabric_layer(self, module, bundle)
+        return self.fabric_view
 
     # Static at the layer level: TRT-LLM then only calls route(); no host weight pool, no stat hooks.
     def is_static_routing(self) -> bool:
@@ -241,6 +274,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.enable_update_weights = False
         self.finalized = False
         self.is_shutdown = False
+        self._fabric = None  # fabric.FabricArena, created at the first GenEPLB layer's create_weights
+        self._body_layers = None  # the model's body layers (balances()): the arena's layer count
 
     def __repr__(self) -> str:
         return (
@@ -256,6 +291,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         """The target model's routed MoE layers are balanced; the MTP / draft MoE layers (layer index past the
         body) keep TRT-LLM's plain expert partition."""
         body = getattr(getattr(model_config, "pretrained_config", None), "num_hidden_layers", None)
+        self._body_layers = None if body is None else int(body)  # sizes the fabric arena
         return body is None or int(moe.layer_idx) < int(body)
 
     def set_repeated_for_next_layer(self, repeated_count: int) -> None:
@@ -344,6 +380,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             li.index: self.mode == "B" for li in self.layers
         }  # B prices every balanced (body) layer
         self._init_pipeline()
+        if fx.FABRIC or COPY_FABRIC in self._copy_armed:
+            self._fx_finalize()  # collective: every layer's planes are its arena rows
         self.finalized = True
         if self.ep_rank == 0:
             names = ",".join(n for n, _ in self.slot_tensors[0])
@@ -352,6 +390,32 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 f"{geo.local_slots} slots/rank ({geo.homes} homes), active {geo.active_slots}, slot planes [{names}], "
                 f"staged {len(self.staged)} layers"
             )
+
+    def fabric_layer(self, layer: GenEplbLayer, module, bundle):
+        """``layer``'s views of the fabric arena, or None (TLLM_GENEPLB_FABRIC off, cost model C). The
+        arena is created at the first call, collectively over MPI: every rank's first GenEPLB layer reaches
+        create_weights in lockstep (model construction; MegaMoE's own symmetric-memory rendezvous runs there too)."""
+        if not fx.FABRIC or self.mode != "B":
+            return None
+        if self._fabric is None:
+            from tensorrt_llm._utils import mpi_comm
+
+            if self._body_layers is None:
+                raise RuntimeError("GenEPLB fabric arena: the model config has no num_hidden_layers to size it")
+            comm = mpi_comm()
+            if comm.Get_size() != self.ep_size:
+                raise RuntimeError(
+                    f"GenEPLB fabric arena: the MPI session has {comm.Get_size()} ranks, EP is {self.ep_size}"
+                )
+            self._fabric = fx.FabricArena.create(
+                bundle, layers=self._body_layers, slots=layer.local_slots, ranks=self.ep_size, rank=self.ep_rank,
+                device=torch.cuda.current_device(), comm=comm,
+            )
+            if self.ep_rank == 0:
+                logger.info(f"GenEPLB fabric arena: {self._fabric.describe()}")
+        return self._fabric.layer_arena(
+            layer.index, bundle, int(getattr(module, "compute_slot_count", layer.local_slots))
+        )
 
     def _slot_tensors(self, layer: GenEplbLayer) -> list:
         """Every per-slot tensor of the layer's backend (first dim = local slots): what an install copies."""
@@ -394,15 +458,17 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             session.Dup(),
             session.Dup(),
         )
-        if not (
-            dist.is_available() and dist.is_initialized() and dist.get_world_size() == self.ep_size
-        ):
-            raise RuntimeError(
-                "GenEPLB copies replicas with torch.distributed NCCL: WORLD must equal EP"
-            )
-        self.copy_group = dist.new_group(ranks=list(range(self.ep_size)), backend="nccl")
-        # Create the NCCL communicator now, with every rank present: a later install may give a rank no copy.
-        dist.all_reduce(torch.zeros(1, device=self.device), group=self.copy_group)
+        self.copy_group = None  # copy=fabric alone: no NCCL group (no NCCL for copies or their sync)
+        if COPY_NCCL in COPY_ARMED[COPY_ARM][0]:
+            if not (
+                dist.is_available() and dist.is_initialized() and dist.get_world_size() == self.ep_size
+            ):
+                raise RuntimeError(
+                    "GenEPLB copies replicas with torch.distributed NCCL: WORLD must equal EP"
+                )
+            self.copy_group = dist.new_group(ranks=list(range(self.ep_size)), backend="nccl")
+            # Create the NCCL communicator now, with every rank present: a later install may give a rank no copy.
+            dist.all_reduce(torch.zeros(1, device=self.device), group=self.copy_group)
         self._probe = torch.zeros(
             1 + self.ep_size, device=self.device
         )  # _copy_due's connection probes
@@ -436,7 +502,19 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self._copy_default = self._copy_mode
         self._copy_hist = {COPY_NCCL: self.copy_ms_history}
         self._copy_ctl = (None, self._copy_mode)  # (CTL file mtime, requested transport)
-        self._ce = None  # fastcopy.CeCopier, armed in after_warmup
+        # the fabric copier (armed in after_warmup), the copies issued at this rank's decision until its
+        # install is agreed, the layers with an install in flight, the totals, the profiler range end, the retired slots
+        # the decision in flight was planned with, the pinned table staging and the snapshot events (pre-created once
+        # fabric is armed: no event and no pinned allocation created mid-step).
+        self._fx = None
+        self._fx_pending = None
+        self._fx_inflight = set()
+        self._fx_stats = dict(installs=0, issued=0, rows=0, replicas=0, mismatch=0, probe_mismatch=0, probe_rows=0,
+                              probe_ms_row=-1.0, ms_row=[], ms_layer=[], status=None)
+        self._fx_prof = None
+        self._fx_retired = {}
+        self._tw_stage = None
+        self._snap_events = None
         self.connected = False
         # No replica held and the last gate admitted none (set by each renewal).
         self.dormant = False
@@ -506,12 +584,15 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self.snap_steps.copy_(self.stats.steps, non_blocking=True)
             if self._snap_nan is not None:
                 self._snap_nan.copy_(self._nan_acc, non_blocking=True)
-            self.snap_event = torch.cuda.Event()
+            self.snap_event = self._snap_event()  # pre-created once fabric is armed
             self.snap_event.record()
 
     def _advance(self) -> None:
         """Move the renewal pipeline forward without blocking the serving thread (rank-local timing:
         every rank makes the same collective calls in the same order and computes the same decision)."""
+        if self._fx_prof is not None and self.forwards >= self._fx_prof:  # the nsys range ends
+            self._fx_prof = None
+            fx.profiler(False)
         if self.snap_event is not None and self.gather is None and self.snap_event.query():
             self._start_gather()
         if (
@@ -538,11 +619,13 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 )
             if plans:
                 first = int(out[0]) + INSTALL_MARGIN
-                self.installs.append(
-                    dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk,
-                         copy=self._copy_mode)
-                )
+                ins = dict(plans=plans, first=first, issued=0, events=[], vote=None, chunk=chunk, copy=self._copy_mode)
+                if ins["copy"] == COPY_FABRIC:
+                    self._fx_attach(ins, int(out[1]))  # copies issued at this rank's decision
+                self.installs.append(ins)
             self._set_copy_mode(int(out[5]))  # the agreed request (MAX over ranks), from the next renewal on
+            if self._fx is not None:
+                self._fx_status()  # on a change only
         self._poll_installs()
 
     def route(self, layer: GenEplbLayer, ids: torch.Tensor) -> torch.Tensor:
@@ -719,6 +802,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self._last = dict(
                 n_rem=n_rem, tokens=tokens, install=install, ctl=ctl, t_guard=t_guard, why=why
             )
+        self._fx_retired = self.retired  # the fabric issue check reads the set this decision uses
         self.worker.request(
             "decide",
             dict(
@@ -740,6 +824,11 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 n_rem=n_rem,
                 frozen=frozen,
                 c_gpu_ms=self.c_gpu_ms,
+                # with the fabric transport agreed, c_gpu_ms holds its per-row median: the gate prices a
+                # layer at c_row_ms x planes x its busiest destination's copies, and every copy gets its source slot
+                c_row_ms=self.c_gpu_ms if self._copy_mode == COPY_FABRIC else None,
+                planes=len(self.slot_tensors[0]),
+                sources=self._copy_mode == COPY_FABRIC,
                 total_active=geo.active_slots,
                 cap=geo.local_slots - geo.homes,
                 install=install,
@@ -782,10 +871,16 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             if c
             else LAYERS_PER_COPY_STEP
         )
-        plan = [(ins["layer"], [tuple(cp) for cp in ins["copies"]]) for ins in reply["installs"]]
+        plan = [
+            (ins["layer"], [tuple(cp) for cp in ins["copies"]])
+            + ((tuple(ins["sources"]),) if "sources" in ins else ())  # the sources are agreed too
+            for ins in reply["installs"]
+        ]
         key = hashlib.blake2b(repr((self.decisions, chunk, plan)).encode(), digest_size=8).digest()
         digest = float(int.from_bytes(key, "little") >> 12)  # 52 bits: exact in a float64
         d = float(self.decisions)
+        if reply["installs"] and self._copy_mode == COPY_FABRIC:  # copy now, agree in the vote
+            self._fx_pending = (self.decisions, self._fx_issue(reply["installs"]))
         vote = np.array([float(self.forwards), d, digest, -d, -digest, float(self._copy_request())])
         out = np.empty(6, dtype=np.float64)
         self.ready_vote = (
@@ -801,8 +896,10 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 f"{'' if self._last.get('install', True) else ' (below LIVE_MIN_T: shares only)'}, "
                 f"shares {len(reply['tables'])} layers, gate {len(reply['installs'])}/{reply['candidates']} layers, "
                 f"N_rem {self._last['n_rem']}{' (live horizon)' if self.live else ''}, c_gpu_ms {self.c_gpu_ms}"
-                f"{note}"
+                f"{note}{self._fx_note()}"
             )
+        if self._fx is not None:
+            self._fx_status()  # <CTL_FILE>.fabric.rank<r>, on a change
         self.dormant = not reply["installs"] and not self._holds_replicas()
         self._next_window()
 
@@ -851,8 +948,11 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 )
                 if self.t_ctl is None and (ctl["pad"] != "spread" or ctl["identity"]):
                     logger.warning("GenEPLB ctl: pad / identity need cost model B's route kernel; mode C ignores them")
-                if ctl["copy"] == "ce":
-                    logger.warning("GenEPLB ctl: copy=ce is reserved; this build copies with NCCL")
+                if ctl["copy"] == "fabric" and COPY_FABRIC not in self._copy_armed:
+                    logger.warning(
+                        "GenEPLB ctl: copy=fabric needs TLLM_GENEPLB_COPY=fabric|both (and TLLM_GENEPLB_FABRIC=1); "
+                        f"copies stay {COPY_MODE_NAMES[self._copy_mode]}"
+                    )
                 if ctl["placement"] == "flex" and (ctl["objective"] != "ef" or ctl["pad"] != "drop"):  # (p56ctl)
                     logger.warning(
                         "GenEPLB ctl: placement=flex needs objective=ef and pad=drop; inert, the planner keeps the lpt "
@@ -896,19 +996,29 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
 
     def _write_tables(self) -> None:
         """Every layer's tables in one H2D per table, between two replays on the forward stream."""
-        for dst, src in (
+        pairs = (
             (self.t_count, self.h_count),
             (self.t_start, self.h_start),
             (self.t_slots, self.h_slots),
             (self.t_cumw, self.h_cumw),
-        ):
-            dst.copy_(maybe_pin_memory(torch.from_numpy(src)), non_blocking=True)
+        )
+        stage = self._tw_slot()  # a persistent pinned staging set once fabric is armed, else None
+        for k, (dst, src) in enumerate(pairs):
+            if stage is None:
+                dst.copy_(maybe_pin_memory(torch.from_numpy(src)), non_blocking=True)
+            else:
+                stage[0][k].numpy()[...] = src
+                dst.copy_(stage[0][k], non_blocking=True)
+        if stage is not None:
+            stage[1].record()
         self.t_wmode.fill_(1)
         if self._ctl_word_next != self._ctl_word:  # the control word switches with the renewal's tables
             self.t_ctl.fill_(self._ctl_word_next)
             self._ctl_word = self._ctl_word_next
         self._drop_words = self._drop_next
         self.pending_writes = False
+        if self._fx is not None:
+            self._fx.war.record()  # WAR: a copy into a slot this write freed starts after it
 
     def _copy_due(self) -> None:
         """Copy the replicas due before this replay. Every rank copies the same chunk of the plan between the
@@ -930,11 +1040,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
 
     def _copy_layers(self, plans, mode=COPY_NCCL):
         """Copy the plans' replicas from their home slots, on the current stream: (start, done) timing events."""
-        if mode == COPY_CE:
-            if self._ce is None:
-                self._arm_ce()  # collective; only if after_warmup did not run (every rank is at this agreed step)
-            if self._ce is not None:
-                return self._ce.copy(plans)  # copy-engine pull through the symmetric staging buffer
+        if mode == COPY_FABRIC:  # issued at the decision (_fx_issue), never at an agreed step
+            raise RuntimeError("GenEPLB: a fabric install is copied at its decision, not by _copy_due")
         import torch.distributed as dist
 
         M = self.geo.local_slots
@@ -990,8 +1097,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.connected = True
         R, r = self.ep_size, self.ep_rank
         torch.cuda.synchronize()
-        if COPY_CE in self._copy_armed and self._ce is None:
-            self._arm_ce()  # symmetric staging buffer (collective); NCCL on every rank if any rank fails
+        if COPY_FABRIC in self._copy_armed and self._fx is None:
+            self._fx_arm()  # copy stream + events (collective); NCCL if armed and any rank fails
         t0 = time.perf_counter()
         send = torch.zeros(CONNECT_BYTES, dtype=torch.uint8, device=self.device)
         recv = torch.empty((R, CONNECT_BYTES), dtype=torch.uint8, device=self.device)
@@ -1021,6 +1128,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         ]
         probe = {}
         for mode in self._copy_armed:  # one startup price per armed transport
+            if mode == COPY_FABRIC:  # ms per ROW of single-hop CE copies on the copy stream
+                probe[mode] = self._fx_probe(n)
+                continue
             for _ in range(2):  # the second, warm copy prices installs (the first pays one-time setup)
                 start, done = self._copy_layers(plans, mode)
                 done.synchronize()
@@ -1030,6 +1140,12 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         )
         for mode, ms in zip(probe, probe_max):
             self._copy_hist[mode] = [ms]
+        if COPY_FABRIC in self._copy_armed:  # the probe's price; its verify mismatches and rows (sums)
+            st = self._fx_stats
+            st["probe_ms_row"] = float(self._copy_hist[COPY_FABRIC][0])
+            st["probe_mismatch"], st["probe_rows"] = (
+                int(self.comm_done.allreduce(int(st[k]), op=MPI.SUM)) for k in ("probe_mismatch", "probe_rows")
+            )
         self._set_copy_mode(self._copy_mode)
         if r == 0:
             logger.info(
@@ -1037,8 +1153,10 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 f"ranks); startup copy probe {len(plans)} layers x {n} replicas/rank: c_gpu_ms {self.c_gpu_ms:.3f}"
                 + ("" if self._copy_armed == (COPY_NCCL,) else
                    f"; copy transports {', '.join(f'{COPY_MODE_NAMES[m]} {p:.3f}' for m, p in zip(probe, probe_max))} "
-                   f"ms/layer, agreed {COPY_MODE_NAMES[self._copy_mode]}; CE {self._ce.describe() if self._ce else 'off'}")
+                   f"ms/layer (fabric: ms/row), agreed {COPY_MODE_NAMES[self._copy_mode]}; {self._fx_describe()}")
             )
+        if self._fx is not None:
+            self._fx_status()  # the probe's totals in <CTL_FILE>.fabric.rank<r>
 
     def _set_copy_mode(self, mode: int) -> None:
         """Make ``mode`` the agreed transport: the median of its measured copies prices the gate."""
@@ -1055,46 +1173,243 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         try:
             mtime = os.stat(COPY_CTL_FILE).st_mtime
             if mtime != self._copy_ctl[0]:
-                from .fastcopy import parse_copy_field
-
                 with open(COPY_CTL_FILE) as f:
-                    want = parse_copy_field(f.read())
+                    want = copy_field(f.read())  # copy=nccl|fabric (copy=ce is withdrawn)
                 self._copy_ctl = (mtime, COPY_MODE_NAMES.index(want) if want else self._copy_default)
         except OSError:
             pass
         return self._copy_ctl[1] if self._copy_ctl[1] in self._copy_armed else self._copy_mode
 
-    def _arm_ce(self) -> None:
-        """Copy-engine transport (fastcopy.py): each rank allocates its symmetric staging buffer, then all
-        rendezvous on the copy group. Collective; if any rank fails, every rank keeps NCCL copies."""
+    # ------------------------------------------------------------------ fabric copies
+    def _fx_finalize(self) -> None:
+        """Before the first forward, on every rank: every GenEPLB layer's seven slot tensors are its fabric arena rows (a
+        Parameter replaced after create_weights would leave the copies writing a stale buffer), and copy=fabric has an
+        arena. A failure on any rank raises on every rank: the MegaMoE barrier has no timeout, so no rank may fail alone
+        after the first collective launch."""
+        err = None
+        try:
+            if self._fabric is None:
+                if COPY_FABRIC in self._copy_armed:
+                    raise RuntimeError(
+                        "TLLM_GENEPLB_COPY=fabric|both needs the fabric arena: TLLM_GENEPLB_FABRIC=1, the MegaMoE "
+                        "backend and cost model B"
+                    )
+            else:
+                self._fabric.check_layers(self.slot_tensors)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        errors = [f"rank {r}: {e}" for r, e in enumerate(self.comm_done.allgather(err)) if e]
+        if errors:
+            raise RuntimeError("GenEPLB fabric: " + "; ".join(errors))
+        if self.ep_rank == 0:
+            if self._fabric is None:
+                logger.warning("GenEPLB: TLLM_GENEPLB_FABRIC=1 but no layer bound the fabric arena (cost model C or not "
+                               "MegaMoE): the shipped allocation")
+            else:
+                unused = self._fabric.L - self.num_layers
+                logger.info(
+                    f"GenEPLB fabric arena checked on every rank: {self.num_layers} layers' planes are the arena rows"
+                    + (f" ({unused} arena layers unused)" if unused else "")
+                )
+
+    def _fx_arm(self) -> None:
+        """The copy stream and event ring, the pinned table staging and the snapshot events. Collective (comm_done): if
+        any rank fails, every rank falls back to NCCL copies when NCCL is armed, else every rank raises."""
         from mpi4py import MPI
 
-        ce, err = None, None
+        err, armed = None, None
         try:
-            from . import fastcopy
+            if self._fabric is None:
+                raise RuntimeError("no fabric arena")
+            copier = fx.FabricCopier(self._fabric, self.device)
+            tables = (self.t_count, self.t_start, self.t_slots, self.t_cumw)
+            stage = []
+            for _ in range(3):
+                bufs = [torch.empty(tuple(t.shape), dtype=t.dtype, pin_memory=True) for t in tables]
+                ev = torch.cuda.Event()
+                ev.record()
+                stage.append((bufs, ev))
+            snaps = [torch.cuda.Event() for _ in range(2)]
+            for ev in snaps:
+                ev.record()
+            torch.cuda.synchronize()
+            armed = (copier, stage, snaps)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        if self.comm_done.allreduce(int(err is None), op=MPI.MIN):
+            self._fx, self._tw_stage, self._snap_events = armed
+            return
+        if COPY_NCCL in self._copy_armed:
+            self._copy_armed, self._copy_mode, self._copy_default = (COPY_NCCL,), COPY_NCCL, COPY_NCCL
+            logger.warning(f"GenEPLB rank {self.ep_rank}: fabric copies unavailable ({err}): NCCL copies")
+            return
+        raise RuntimeError(f"GenEPLB rank {self.ep_rank}: fabric copies unavailable ({err}) and NCCL is not armed")
 
-            geo = self.geo
-            ce = fastcopy.CeCopier(
-                self.slot_tensors, home_slot=geo.home_slot, local_slots=geo.local_slots, ranks=self.ep_size,
-                rank=self.ep_rank, group=self.copy_group, device=self.device,
-            )
-        except Exception as e:  # any local failure: the ranks agree on NCCL below
-            ce, err = None, e
-        item = ce.item if ce is not None else -1
-        mine = np.array([int(ce is not None), item, -item], dtype=np.int64)
-        agreed = np.empty_like(mine)
-        self.comm_done.Allreduce(mine, agreed, op=MPI.MIN)
-        if agreed[0] and agreed[1] == -agreed[2]:  # every rank allocated, one staging layout
-            try:
-                ce.connect()  # collective rendezvous: every peer's staging buffer mapped (fabric handles)
-            except Exception as e:
-                err = e
-            if self.comm_done.allreduce(int(err is None), op=MPI.MIN):
-                self._ce = ce
-                return
-        self._ce = None
-        self._copy_armed, self._copy_mode, self._copy_default = (COPY_NCCL,), COPY_NCCL, COPY_NCCL
-        logger.warning(f"GenEPLB rank {self.ep_rank}: copy-engine transport unavailable ({err!r}): NCCL copies")
+    def _fx_issue(self, installs) -> dict:
+        """This rank's rows of a decision's installs, enqueued NOW on the copy stream after the WAR event (recorded on
+        the forward stream after the last table write: every slot that write freed is unread from then on). The slot
+        rules are checked first on every copy (every rank checks the same plan): destination a spare slot FREE in the
+        current layout and not retired, source holding the expert. -> the in-flight record."""
+        if self._fx is None:
+            raise RuntimeError("GenEPLB: a fabric install before the copier was armed (after_warmup)")
+        geo, M = self.geo, self.geo.local_slots
+        for p in installs:
+            li = int(p["layer"])
+            if li in self._fx_inflight:
+                raise RuntimeError(f"GenEPLB fabric: layer {li} already has an install in flight")
+            cur, retired = self.layouts[li], set(self._fx_retired.get(li, ()))
+            srcs = p.get("sources") or [geo.home_slot(int(e)) for e, _ in p["copies"]]
+            for (e, d), s in zip(p["copies"], srcs):
+                if cur[d] >= 0 or d in retired or d % M < geo.homes or cur[s] != e:
+                    raise RuntimeError(
+                        f"GenEPLB fabric: layer {li} copy of expert {e} from slot {s} to {d} breaks the slot rules "
+                        f"(destination holds {cur[d]}, retired {d in retired}, source holds {cur[s]})"
+                    )
+        rows = fx.install_rows(installs, rank=self.ep_rank, M=M, home_slot=geo.home_slot, addr=self._fabric.addr,
+                               rows=self._fabric.rows)
+        st = self._fx_stats
+        st["issued"] += 1
+        if fx.NSYS_INSTALL and st["issued"] == fx.NSYS_INSTALL:
+            fx.profiler(True)  # the nsys capture range opens right before this install's copies
+        start, done = self._fx.issue(rows, war=self._fx.war)
+        self._fx_inflight.update(int(p["layer"]) for p in installs)
+        return dict(rows=rows, start=start, done=done, layers=len(installs), nth=st["issued"])
+
+    def _fx_attach(self, ins: dict, decision: int) -> None:
+        """The agreed install takes the copies this rank issued at its decision: one chunk, already issued (_copy_due
+        skips it); _poll_installs votes once its done event E completed."""
+        pend, self._fx_pending = self._fx_pending, None
+        if pend is None or pend[0] != decision:
+            raise RuntimeError(f"GenEPLB fabric: no copies were issued for decision {decision} ({pend and pend[0]})")
+        rec = pend[1]
+        ins.update(chunk=max(1, len(ins["plans"])), issued=1, fx=rec,
+                   events=[(rec["start"], rec["done"], max(1, len(rec["rows"]["dst"])))])
+
+    def _fx_vote(self, ins: dict):
+        """A fabric install's done vote (MAX over ranks): [ms per row, ms per layer, rows of rank r at 2 + r, verify
+        mismatches of rank r at 2 + R + r]. Its done event completed (queried), so nothing waits (VERIFY does)."""
+        rec, R, r = ins["fx"], self.ep_size, self.ep_rank
+        n = len(rec["rows"]["dst"])
+        ms = rec["start"].elapsed_time(rec["done"])
+        v = np.zeros(2 + 2 * R, dtype=np.float64)
+        v[0], v[1] = ms / max(1, n), ms / max(1, rec["layers"])
+        v[2 + r] = n
+        v[2 + R + r] = self._fx.verify(rec["rows"], rec["done"]) if fx.VERIFY else 0
+        return v
+
+    def _fx_publish(self, ins: dict) -> None:
+        """Every rank's copies landed (the done vote): the forward stream waits E (the read-after-write order made
+        visible to CUDA), the install's layers leave the in-flight set, the totals and the status file update."""
+        rec, recv, R = ins["fx"], ins["recv"], self.ep_size
+        torch.cuda.current_stream().wait_event(rec["done"])
+        self._fx_inflight.difference_update(int(p["layer"]) for p in ins["plans"])
+        st = self._fx_stats
+        st["installs"] += 1
+        st["rows"] += int(recv[2 : 2 + R].sum())
+        st["replicas"] += sum(len(p["copies"]) for p in ins["plans"])
+        st["mismatch"] += int(recv[2 + R : 2 + 2 * R].sum())
+        st["ms_row"] = (st["ms_row"] + [float(recv[0])])[-4096:]
+        st["ms_layer"] = (st["ms_layer"] + [float(recv[1])])[-4096:]
+        if fx.NSYS_INSTALL and rec["nth"] == fx.NSYS_INSTALL:
+            self._fx_prof = self.forwards + fx.NSYS_STEPS  # cudaProfilerStop that many forwards after this publish
+        self._fx_status()
+
+    def _fx_probe(self, n: int) -> float:
+        """The startup probe on the fabric transport: every rank pulls n home experts of the PREVIOUS rank (not what
+        loading left in its spare rows) into its first n spare slots (FREE) of PROBE_LAYERS layers, twice (the second,
+        warm copy prices the first gate). -> this rank's ms per row; VERIFY compares every row. The first
+        cudaMemcpyBatchAsync calls run here: a failure on any rank (call form, a peer mapping, ...) is voted on comm_done
+        and raises on every rank, instead of leaving the other ranks in after_warmup's allreduces."""
+        err, ms = None, -1.0
+        try:
+            geo, R, r = self.geo, self.ep_size, self.ep_rank
+            src = (r - 1) % R
+            plans = [
+                dict(layer=li, copies=[(src * geo.homes + j, r * geo.local_slots + geo.homes + j) for j in range(n)])
+                for li in range(min(PROBE_LAYERS, self.num_layers))
+            ]
+            rows = fx.install_rows(plans, rank=r, M=geo.local_slots, home_slot=geo.home_slot, addr=self._fabric.addr,
+                                   rows=self._fabric.rows)
+            for _ in range(2):
+                start, done = self._fx.issue(rows, war=self._fx.war)
+                done.synchronize()
+            st = self._fx_stats
+            st["probe_rows"] = len(rows["dst"])
+            st["probe_mismatch"] = self._fx.verify(rows, done) if fx.VERIFY else 0
+            ms = start.elapsed_time(done) / max(1, len(rows["dst"]))
+        except Exception as exc:  # every rank learns it below and raises
+            err = f"{type(exc).__name__}: {exc}"
+        errors = [f"rank {k}: {e}" for k, e in enumerate(self.comm_done.allgather(err)) if e]
+        if errors:
+            raise RuntimeError("GenEPLB fabric startup probe failed: " + "; ".join(errors))
+        return ms
+
+    def _fx_copy_text(self, ins: dict) -> str:
+        """The install line's copy cost. It starts '<ms> ms/layer' like the NCCL line, so a parser of the NCCL install
+        line (regex 'copy ([\\d.]+) ms/layer') reads fabric installs too."""
+        recv, R = ins["recv"], self.ep_size
+        rows = recv[2 : 2 + R]
+        return (f"{recv[1]:.3f} ms/layer (fabric CE: {recv[0] * 1e3:.2f} us/row, rows {int(rows.sum())} total, "
+                f"{int(rows.max())} on the busiest rank, verify mismatches {int(recv[2 + R : 2 + 2 * R].sum())})")
+
+    def _fx_note(self) -> str:
+        """The renewal line's fabric note (fabric armed only)."""
+        if self._fx is None:
+            return ""
+        st = self._fx_stats
+        p50 = float(np.median(st["ms_row"])) * 1e3 if st["ms_row"] else float("nan")
+        return (f" | fabric: agreed {COPY_MODE_NAMES[self._copy_mode]}, installs {st['installs']}, replicas "
+                f"{st['replicas']}, rows {st['rows']}, us/row p50 {p50:.2f}, verify mismatches "
+                f"{st['mismatch'] + st['probe_mismatch']}")
+
+    def _fx_describe(self) -> str:
+        st = self._fx_stats
+        return (f"fabric {self._fx.describe() if self._fx else 'off'}; probe rows {st['probe_rows']}, verify mismatches "
+                f"{st['probe_mismatch']}" + ("" if fx.VERIFY else " (not verified)"))
+
+    def _fx_status(self) -> None:
+        """<CTL_FILE>.fabric.rank<r>: this rank's fabric totals (voted, so the same on every rank), on a change."""
+        if not CTL_FILE:
+            return
+        st = self._fx_stats
+        med = lambda v: float(np.median(v)) if v else -1.0  # noqa: E731
+        text = (
+            f"rank={self.ep_rank} agreed={COPY_MODE_NAMES[self._copy_mode]} armed="
+            f"{','.join(COPY_MODE_NAMES[m] for m in self._copy_armed)} verify={int(fx.VERIFY)} installs={st['installs']} "
+            f"issued={st['issued']} replicas={st['replicas']} rows={st['rows']} mismatch={st['mismatch']} "
+            f"probe_rows={st['probe_rows']} probe_mismatch={st['probe_mismatch']} "
+            f"probe_ms_row={st['probe_ms_row']:.6f} ms_row_p50={med(st['ms_row']):.6f} "
+            f"ms_row_max={max(st['ms_row'], default=-1.0):.6f} ms_layer_p50={med(st['ms_layer']):.6f} "
+            f"ms_layer_max={max(st['ms_layer'], default=-1.0):.6f} renewals={self.renewals} forwards={self.forwards}"
+        )
+        key = text.split(" renewals=")[0]
+        if key == st["status"]:
+            return
+        st["status"] = key
+        path = f"{CTL_FILE}.fabric.rank{self.ep_rank}"
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(text + "\n")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _snap_event(self):
+        """The window's snapshot event: one of two pre-created ones once fabric is armed (the one reused was queried
+        complete a full renewal ago), else a new one (shipped)."""
+        if not self._snap_events:
+            return torch.cuda.Event()
+        self._snap_events.append(self._snap_events.pop(0))
+        return self._snap_events[-1]
+
+    def _tw_slot(self):
+        """A pinned table staging set whose last H2D finished (event query, never a host wait); None without fabric, or
+        when every set is still in flight (the shipped per-write pinned copy then)."""
+        for stage in self._tw_stage or ():
+            if stage[1].query():
+                return stage
+        return None
 
     def _poll_installs(self) -> None:
         """Vote once this rank's copies of an install landed; publish once every rank's have. Never blocks: a
@@ -1109,9 +1424,12 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                     return
                 from mpi4py import MPI
 
-                ms = max(s.elapsed_time(d) / max(1, n) for s, d, n in ins["events"])
-                ins["send"] = np.array([ms])
-                ins["recv"] = np.empty(1, dtype=np.float64)
+                if ins.get("copy") == COPY_FABRIC:  # [ms/row, ms/layer, rows, mismatches per rank]
+                    ins["send"] = self._fx_vote(ins)
+                else:
+                    ms = max(s.elapsed_time(d) / max(1, n) for s, d, n in ins["events"])
+                    ins["send"] = np.array([ms])
+                ins["recv"] = np.empty(ins["send"].size, dtype=np.float64)
                 ins["vote"] = self.comm_done.Iallreduce(ins["send"], ins["recv"], op=MPI.MAX)
             if not ins["vote"].Test():
                 return
@@ -1119,6 +1437,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self._publish(ins)
 
     def _publish(self, ins: dict) -> None:
+        if ins.get("copy") == COPY_FABRIC:
+            self._fx_publish(ins)  # the forward stream waits E before this publish's table write
         for p in ins["plans"]:
             li = p["layer"]
             old, new = self.layouts[li], list(p["layout"])
@@ -1135,7 +1455,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             copies = sum(len(p["copies"]) for p in ins["plans"])
             logger.info(
                 f"GenEPLB install {self.install_count} @replay {self.replays}: {len(ins['plans'])} layers, "
-                f"{copies} replicas, copy {copy_ms:.3f} ms/layer{' (ce)' if mode == COPY_CE else ''} (max over ranks), "
+                f"{copies} replicas, copy "
+                f"{self._fx_copy_text(ins) if mode == COPY_FABRIC else f'{copy_ms:.3f} ms/layer'} (max over ranks), "
                 f"gate estimate {self.c_gpu_ms:.3f} "
                 f"(median of {len(self.copy_ms_history)})"
             )

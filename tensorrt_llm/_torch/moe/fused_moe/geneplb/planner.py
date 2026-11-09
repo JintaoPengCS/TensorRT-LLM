@@ -317,6 +317,38 @@ def source_slot(layout: list, expert: int, geo: Geometry) -> int:
     return geo.home_slot(expert)
 
 
+def copy_sources(cur: list, copies, geo: Geometry, egress: list, load=None) -> list:
+    """The slot each copy of an install reads (the fabric transport maps every holder's rows on every
+    rank): among the expert's current holders -- its home and every spare slot holding it in the CURRENT layout, all
+    resident (copies land only in FREE slots, and a slot a layout drops keeps its bytes until a later install overwrites
+    it, which needs this install published first) -- the one on the least loaded rank: fewest reads assigned so far in
+    this install (``egress`` per rank, updated in place across the install's layers), then the fewest modeled rows
+    (``load`` per rank under the current layout and shares), then the lower slot. A pure function of the decision: the
+    same on every rank."""
+    M = geo.local_slots
+    holders = {}
+    for s, e in enumerate(cur):
+        if e >= 0:
+            holders.setdefault(int(e), []).append(s)
+    out = []
+    for e, _ in copies:
+        cand = holders.get(int(e)) or [geo.home_slot(int(e))]
+        s = min(cand, key=lambda s: (egress[s // M], float(load[s // M]) if load is not None else 0.0, s))
+        egress[s // M] += 1
+        out.append(int(s))
+    return out
+
+
+def copy_rows(copies, geo: Geometry, planes: int) -> int:
+    """The fabric gate's rows of a layer's copies: planes x the most copies one destination rank pulls
+    (each rank pulls its replicas on its own copy stream; the busiest one sets the layer's copy time)."""
+    per = {}
+    for _, d in copies:
+        r = int(d) // geo.local_slots
+        per[r] = per.get(r, 0) + 1
+    return int(planes) * max(per.values()) if per else 0
+
+
 def layer_us(model: dict, cbar, phys, weights, geo: Geometry) -> float:
     """Busiest GPU's MoE microseconds of one layer under ``phys`` / ``weights`` (form T or B)."""
     if _objective() == "ef" and costmodel.is_b(model) and "T" in model:  # P5: the eF objective prices the gate's layouts
@@ -406,6 +438,9 @@ def _decide(req: dict) -> dict:
     geo = Geometry(**req["geo"])
     E, n_rem = geo.experts, req["n_rem"]
     c_gpu = req["c_gpu_ms"] or 0.0
+    c_row = req.get("c_row_ms")  # the fabric transport's per-row price; None: the per-layer c_gpu
+    planes = int(req.get("planes") or 7)
+    src_load = {}  # layer -> modeled rows per rank under the current layout (copy sources)
     frozen = set(req.get("frozen", ()))
     ctl = req.get("ctl")  # gate overrides and diagnostics; absent: the shipped gate
     if ctl is not None:
@@ -443,11 +478,13 @@ def _decide(req: dict) -> dict:
         if ctl is not None:
             diag["n_eval"] += 1
             diag["cur_new"] += gain_ms * 1e3
-        if gain_ms * n_rem > c_gpu:
+        if gain_ms * n_rem > (c_gpu if c_row is None else c_row * copy_rows(copies, geo, planes)):
             if ctl is not None and not _ctl_admit(ctl, layer, plan, gain_ms, hyst_next, diag):
                 continue
             cands[layer] = gain_ms
             plans[layer] = (new, copies, w_new)
+            if req.get("sources"):
+                src_load[layer] = costmodel.slot_rows(cbar, cur, w_cur).reshape(geo.ranks, geo.local_slots).sum(axis=1)
     order = sorted(cands, key=lambda li: (-cands[li], li))[: req["max_layers"]]
     installs = [
         dict(
@@ -458,6 +495,11 @@ def _decide(req: dict) -> dict:
         )
         for li in order
     ]
+    if req.get("sources"):  # every copy's source slot, the reads balanced over the whole install
+        egress = [0] * geo.ranks
+        for ins in installs:
+            li = ins["layer"]
+            ins["sources"] = copy_sources(req["layouts"][li], ins["copies"], geo, egress, src_load.get(li))
     out = dict(
         tables=out_tables,
         installs=installs,
