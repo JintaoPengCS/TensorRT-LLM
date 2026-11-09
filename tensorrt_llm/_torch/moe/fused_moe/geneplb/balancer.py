@@ -51,6 +51,12 @@ COPY_BUDGET_MS = 4.0
 # in replays is rank-local (each rank opens its next window after it applied the decision, at its own replay).
 LIVE_HORIZON = 2048
 LIVE_COOLDOWN = 32
+# Live serving below the cost model's measured tiers (T < 32 real decode rows of one replay on the busiest rank; the
+# prior there is the T = 32 row, never measured): a renewal re-solves the shares and installs no new replica.
+# Measured at T 4..24 (GEN DEP32, 388 lanes, ~2.6 requests per rank): ~1400 installs per run moved ~115k replicas and
+# cost +1.7..6 % mean GEN step against no balancer, while a run that installed nothing matched it.
+# TLLM_GENEPLB_LIVE_MIN_T overrides the floor (0: off).
+LIVE_MIN_T = int(os.environ.get("TLLM_GENEPLB_LIVE_MIN_T", "32"))
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
 CONNECT_BYTES = 4 << 20
@@ -547,7 +553,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             ]
         geo = self.geo
         b_params = costmodel.prior_params(max(1, tokens)) if self.mode == "B" else None
-        self._last = dict(n_rem=n_rem, tokens=tokens)
+        install = not (self.live and tokens < LIVE_MIN_T)
+        self._last = dict(n_rem=n_rem, tokens=tokens, install=install)
         self.worker.request(
             "decide",
             dict(
@@ -571,7 +578,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 c_gpu_ms=self.c_gpu_ms,
                 total_active=geo.active_slots,
                 cap=geo.local_slots - geo.homes,
-                install=True,
+                install=install,
                 max_layers=L,
             ),
         )
@@ -610,7 +617,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         )
         if self.ep_rank == 0:
             logger.info(
-                f"GenEPLB renewal {self.renewals} @replay {self.replays}: mode {self.mode}, T {self._last['tokens']}, "
+                f"GenEPLB renewal {self.renewals} @replay {self.replays}: mode {self.mode}, T {self._last['tokens']}"
+                f"{'' if self._last.get('install', True) else ' (below LIVE_MIN_T: shares only)'}, "
                 f"shares {len(reply['tables'])} layers, gate {len(reply['installs'])}/{reply['candidates']} layers, "
                 f"N_rem {self._last['n_rem']}{' (live horizon)' if self.live else ''}, c_gpu_ms {self.c_gpu_ms}"
             )
