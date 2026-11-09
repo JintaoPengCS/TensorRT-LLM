@@ -87,6 +87,11 @@ CTL_SPEC = (
     ("gate_hyst", int, 1),  # consecutive renewals a layer's plan (same digest) must pass before it installs
     ("gate_horizon", int, -1),  # the payback horizon in replays; 'fixed': the shipped one
     ("copy", {"nccl": 0, "ce": 1}, 0),  # reserved for the copy prototype (this build copies with NCCL either way)
+    # The P5 / P6 policies at run time: the decide request carries them (with pad) and
+    # the planner worker uses them instead of TLLM_GENEPLB_OBJECTIVE / TLLM_GENEPLB_PLACEMENT (planner.py _run_controls);
+    # placement=flex is inert (lpt) unless objective=ef and pad=drop. Cost model B only (mode C ignores both).
+    ("objective", {"shipped": 0, "ef": 1}, 0),  # shipped cost model B on the window means | P5 eF (expected-max) objective
+    ("placement", {"lpt": 0, "flex": 1}, 0),  # shipped rows-LPT | P6 flex options (every rank's 2 busiest homes)
 )
 CTL_DEFAULT = tuple(float(d) for _, _, d in CTL_SPEC)
 CTL_PAD_WORD = {"spread": 0, "drop": 1, "stock": 2}  # l3b_route_kernels.cu LB_PAD_* (control word bits 0-1)
@@ -134,6 +139,8 @@ def ctl_fields(codes) -> dict:
         gate_hyst=max(1, int(c["gate_hyst"])),
         gate_horizon=None if c["gate_horizon"] < 1 else int(c["gate_horizon"]),
         copy="ce" if c["copy"] >= 1 else "nccl",
+        objective="ef" if c["objective"] >= 1 else "shipped",
+        placement="flex" if c["placement"] >= 1 else "lpt",
     )
 
 
@@ -143,7 +150,7 @@ def ctl_text(f: dict) -> str:
         f"install={f['install']} min_t={f['min_t']} guard_t={f['guard_t']} pad={f['pad']} identity={f['identity']} "
         f"gate_tau={'prior' if f['gate_tau'] is None else repr(f['gate_tau'])} gate_margin_us={f['gate_margin_us']!r} "
         f"gate_hyst={f['gate_hyst']} gate_horizon={'fixed' if f['gate_horizon'] is None else f['gate_horizon']} "
-        f"copy={f['copy']}"
+        f"copy={f['copy']} objective={f['objective']} placement={f['placement']}"
     )
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
@@ -746,6 +753,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                             gate_margin_us=ctl["gate_margin_us"],
                             gate_hyst=ctl["gate_hyst"],
                             hyst=self._hyst,
+                            objective=ctl["objective"],  # (p56ctl) the planner's run-time P5 / P6 switch
+                            placement=ctl["placement"],
+                            pad=ctl["pad"],  # placement=flex is inert unless pad=drop
                         )
                     )
                 ),
@@ -843,6 +853,13 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                     logger.warning("GenEPLB ctl: pad / identity need cost model B's route kernel; mode C ignores them")
                 if ctl["copy"] == "ce":
                     logger.warning("GenEPLB ctl: copy=ce is reserved; this build copies with NCCL")
+                if ctl["placement"] == "flex" and (ctl["objective"] != "ef" or ctl["pad"] != "drop"):  # (p56ctl)
+                    logger.warning(
+                        "GenEPLB ctl: placement=flex needs objective=ef and pad=drop; inert, the planner keeps the lpt "
+                        "placement"
+                    )
+                if self.mode != "B" and (ctl["objective"] != "shipped" or ctl["placement"] != "lpt"):  # (p56ctl)
+                    logger.warning("GenEPLB ctl: objective / placement need cost model B; mode C ignores them")
             self._ctl_applied = status
             self._ctl_status(status)
         d = reply.get("diag") or {}

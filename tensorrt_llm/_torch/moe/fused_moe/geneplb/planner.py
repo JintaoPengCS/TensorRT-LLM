@@ -57,6 +57,50 @@ if PLACEMENT != "lpt" and OBJECTIVE != "ef":
     PLACEMENT = "lpt"
 _EF = {}  # the layer under decision (decide() solves its CURRENT layout first): totals, rates, params, model, tau, cur, hint
 _EF_PARAMS = {}  # (T, ranks, local_slots) -> the prior v2 params
+# Run-time switching through the control file (balancer.py CTL_SPEC objective /
+# placement): a decide() request whose ctl carries objective / placement (every rank sends the MAX over ranks of the codes,
+# so every rank decides alike) runs on them instead of the env values above; a request without them (no control file) runs on
+# the env values. placement=flex runs only with objective=ef and the request's pad=drop (P6 flex with spread
+# padding is worse than shipped in simulation); otherwise it is inert (lpt placement), with a one-time
+# warning per reason on stderr.
+_RUN = None  # (objective, placement) of the decide() in progress, from its request; None: the env values
+_WARNED = set()  # the one-time warnings already printed
+
+
+def _objective() -> str:
+    return OBJECTIVE if _RUN is None else _RUN[0]
+
+
+def _placement() -> str:
+    return PLACEMENT if _RUN is None else _RUN[1]
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print("GenEPLB planner: " + msg, file=sys.stderr)
+
+
+def _run_controls(req: dict):
+    """(objective, placement) of a decide() request whose ctl carries the run-time fields, else None (the env values)."""
+    ctl = req.get("ctl") or {}
+    if "objective" not in ctl and "placement" not in ctl:
+        return None
+    if OBJECTIVE != "mean" or PLACEMENT != "lpt":
+        _warn_once(
+            "env",
+            "TLLM_GENEPLB_OBJECTIVE / TLLM_GENEPLB_PLACEMENT (%s / %s) are ignored: the control file's objective / "
+            "placement fields rule" % (OBJECTIVE, PLACEMENT),
+        )
+    obj = "ef" if ctl.get("objective") == "ef" else "mean"
+    plc = "flex" if ctl.get("placement") == "flex" else "lpt"
+    if plc == "flex" and obj != "ef":
+        _warn_once("flex-ef", "placement=flex needs objective=ef; inert (lpt placement) while objective=shipped")
+        plc = "lpt"
+    elif plc == "flex" and ctl.get("pad") != "drop":
+        _warn_once("flex-pad", "placement=flex needs pad=drop; inert (lpt placement) while pad is not drop")
+        plc = "lpt"
+    return obj, plc
 
 
 def _ef_params(b_params: dict, geo: Geometry) -> dict:
@@ -141,7 +185,7 @@ def _fixedhome_targets_ef(geo: Geometry, total_active: int, cap: int) -> dict:
     M, H = geo.local_slots, geo.homes
     cur = ctx.get("cur") or []
     held = {e: s // M for s, e in enumerate(cur) if e >= 0 and s % M >= H}
-    if PLACEMENT == "flex":
+    if _placement() == "flex":
         ctx["hint"] = None
         return placement_ef.flex(
             ctx["model"], ctx["rates"], geo.ranks, H, total_active - geo.experts, cap, per_rank=int(p["per_rank"]),
@@ -193,7 +237,7 @@ def fixedhome_targets(load, geo: Geometry, total_active: int, cap: int) -> dict:
     least-loaded rank with room under ``cap`` that does not hold the expert (ties to the smaller rank),
     a second copy on one rank only when every rank with room holds it -- the shipped planner's order.
     """
-    if PLACEMENT != "lpt" and _EF.get("totals") is load:  # P6 (decide() solved this layer's current layout first)
+    if _placement() != "lpt" and _EF.get("totals") is load:  # P6 (decide() solved this layer's current layout first)
         return _fixedhome_targets_ef(geo, total_active, cap)
     E, R, H = geo.experts, geo.ranks, geo.homes
     load = [_f32(float(x)) for x in load]
@@ -275,7 +319,7 @@ def source_slot(layout: list, expert: int, geo: Geometry) -> int:
 
 def layer_us(model: dict, cbar, phys, weights, geo: Geometry) -> float:
     """Busiest GPU's MoE microseconds of one layer under ``phys`` / ``weights`` (form T or B)."""
-    if OBJECTIVE == "ef" and costmodel.is_b(model) and "T" in model:  # P5: the eF objective prices the gate's layouts
+    if _objective() == "ef" and costmodel.is_b(model) and "T" in model:  # P5: the eF objective prices the gate's layouts
         p = _ef_params(model, geo)
         m = placement_ef.Model.from_params(p, geo.ranks)
         rates = [float(x) for x in cbar]
@@ -287,7 +331,7 @@ def layer_us(model: dict, cbar, phys, weights, geo: Geometry) -> float:
 def solve_weights(mode: str, totals, scale: float, phys, geo: Geometry, b_params):
     """Per-slot shares of ``phys`` (C: the rows split of the window totals; B: cost model B on the per-launch rows
     totals x scale; a refused B input falls back to the rows split, as shipped)."""
-    if OBJECTIVE == "ef" and mode == "B" and b_params is not None:  # P5
+    if _objective() == "ef" and mode == "B" and b_params is not None:  # P5
         return _solve_weights_ef(totals, scale, phys, geo, b_params)
     if mode == "B" and b_params is not None:
         w = shares.solve_b(totals, phys, float(scale), geo.local_slots, b_params)
@@ -335,6 +379,17 @@ def _ctl_admit(ctl: dict, layer, plan: dict, gain_ms: float, hyst_next: dict, di
 
 
 def decide(req: dict) -> dict:
+    """_decide() under the request's objective / placement (_run_controls; without them the env values),
+    set for this decision only."""
+    global _RUN
+    _RUN = _run_controls(req)
+    try:
+        return _decide(req)
+    finally:
+        _RUN = None
+
+
+def _decide(req: dict) -> dict:
     """One renewal on every rank: shares of every layer's current layout and the layers whose new replicas pay.
 
     req: geo (Geometry fields), mode 'C' | 'B', b_params, gate_model, totals {layer: every expert's statistics
