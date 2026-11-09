@@ -186,6 +186,63 @@ def ctl_text(f: dict) -> str:
         f"copy={f['copy']} objective={f['objective']} placement={f['placement']} "
         f"params={'default' if f['params'] is None else f['params']}"
     )
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# ident_t: identity routing on the small padded buckets.
+#   Token 'ident_t=<n>' (n >= 0) in TLLM_GENEPLB_CTL_FILE; off (the default): no token, ident_t=off | default | -1. Off is the
+#   default code path (begin_step tests one attribute) and the default control line (ctl_text prints ident_t only while on).
+#   Per replay: a counted decode replay (a graph replay outside warm-up) whose padded rows per rank
+#     T_pad = len(generation_requests) x (1 + draft_len) (the captured batch: graph padding and attention-DP dummies
+#     included, the T guard_t=padded tests) is <= n routes every id to its home slot: CTL_IDENTITY_BIT OR-ed into the
+#     renewal's word, so the pad mode in force stays (pad=drop still drops the padding rows). A larger T_pad, and every
+#     forward that is not a counted replay (eager: no agreed padded batch), routes with the renewal's word (B).
+#   Rank agreement: attention-DP ranks replay the same padded batch in a step (cuda_graph_runner.py _agree_graph_shape:
+#     a graph only when every rank can and every padded batch size is equal, else every rank runs eager), so T_pad and the
+#     decision are the same on every rank. A new n (the MAX over ranks of the gathered codes, as every field) takes effect
+#     at one forward on every rank: the MAX over ranks of the forward the decision was applied at (the ready vote every
+#     renewal already runs, out[0]) + P4_MARGIN; a rank that sees the vote later switches at once and records it as late.
+#   Writes: begin_step fills t_ctl (forward stream, between two replays: no host sync, no allocation) only when the word
+#     changes; a renewal's own t_ctl write (_write_tables) is tracked through _ctl_word (a 'resync' write re-applies the bit).
+#   Installs: a renewal whose T_pad (MAX over its window and the ranks) is <= n installs no new replica (shares only), after
+#     the min_t guard (live only, real or padded T per guard_t, T < min_t) and identity / freeze: the renewal line's reason is
+#     the first that applies ('padded T <T> <= ident_t <n>' for this one).
+#   Logs: rank 0's renewal line gets ' | p4 t=<n> fwd <a>-<b>: <T_pad>:<identity>/<B> ... eager <e> flips <f> writes <w>
+#     resync <r>' per segment since the last renewal (a switch starts a segment); 'GenEPLB p4 switch' lines; every rank
+#     rewrites <CTL_FILE>.p4.rank<r> (JSON: every closed epoch's counters) at each switch.
+#   Cost model B's route kernels only (the control word): in mode C ident_t is inert (rank 0 warns).
+class _P4IdentCodes(dict):
+    """parse_ctl's codes of ident_t (a dict kind): 'off' | 'default' | '-1' -> -1 (off); a decimal integer >= 0 -> itself."""
+
+    def __missing__(self, value):
+        if not (value.isascii() and value.isdigit() and len(value) <= 9):
+            raise KeyError(value)
+        return int(value)
+
+
+CTL_SPEC = CTL_SPEC + (("ident_t", _P4IdentCodes({"off": -1, "default": -1, "-1": -1}), -1),)  # appended last
+CTL_DEFAULT = tuple(float(d) for _, _, d in CTL_SPEC)
+P4_INDEX = len(CTL_SPEC) - 1  # ident_t's place in a code vector (parse_ctl's, and the gathered tail's MAX over ranks)
+P4_MARGIN = 2 * INSTALL_MARGIN  # forwards from the last rank's apply of a decision to its agreed ident_t switch
+_p4_base_ctl_fields, _p4_base_ctl_text = ctl_fields, ctl_text
+
+
+def ctl_fields(codes) -> dict:
+    """The fields of a code vector (the ctl_fields above) and ident_t (-1: off)."""
+    f = _p4_base_ctl_fields(codes)
+    v = float(codes[P4_INDEX]) if len(codes) > P4_INDEX else -1.0
+    f["ident_t"] = int(v) if v >= 0 else -1
+    return f
+
+
+def ctl_text(f: dict) -> str:
+    """The canonical control line (the ctl_text above) with ' ident_t=<n>' while ident_t is on; off, the line
+    without ident_t, byte for byte (it parses back to ident_t -1)."""
+    t = _p4_base_ctl_text(f)
+    n = f.get("ident_t", -1)
+    return t if n is None or n < 0 else f"{t} ident_t={n}"
+
+
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
 CONNECT_BYTES = 4 << 20
@@ -610,6 +667,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self._copy_due()
         if self.pending_writes:
             self._write_tables()
+        if self._p4_live:  # this forward's identity bit (t_ctl written only when the word changes)
+            self._p4_step(counted, len(scheduled_requests.generation_requests) * (1 + self.draft_len))
         if counted:
             self.replays += 1
 
@@ -648,6 +707,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         if self.ready_vote is not None and self.ready_vote[0].Test():
             _, (_, out), plans, chunk = self.ready_vote
             self.ready_vote = None
+            if self._p4_q:  # a pending ident_t switch: its agreed forward (MAX of the apply forwards + P4_MARGIN)
+                self._p4_vote(int(out[0]), int(out[1]))
             if (
                 out[1] != -out[3] or out[2] != -out[4]
             ):  # MAX != MIN of the decision index or the plan digest
@@ -849,6 +910,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             why = "" if install else f"{ctl['guard_t']} T {t_guard} < min_t {ctl['min_t']}"
             if ctl["identity"] or ctl["install"] == "freeze":
                 install, why = False, ("identity" if ctl["identity"] else "freeze")
+            if ctl["ident_t"] >= 0 and install and self.t_ctl is not None and ctl["T_pad"] <= ctl["ident_t"]:
+                install, why = False, f"padded T {ctl['T_pad']} <= ident_t {ctl['ident_t']}"  # these replays route identity
             if ctl["gate_horizon"] is not None and n_rem is not None:
                 n_rem = float(ctl["gate_horizon"])
             self._last = dict(
@@ -1048,6 +1111,145 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             os.replace(tmp, path)
         except OSError:
             pass
+
+    # ------------------------------------------------------------------ identity on the small padded buckets
+    # Class-level defaults (no __init__ / _init_pipeline edit): every rank starts off, on the default path (begin_step tests
+    # _p4_live only), until a decision applies ident_t >= 0.
+    _p4_live = False  # begin_step calls _p4_step: an ident_t in force, a switch pending, or the word still to restore
+    _p4_t = -1  # the ident_t in force at this forward (-1: off)
+    _p4_want = -1  # the ident_t of the newest applied decision (where the pending switches lead)
+    _p4_q = ()  # pending switches [decision, ident_t, agreed forward (None until its ready vote)], oldest first
+    _p4_dev = 0  # the word t_ctl holds as P4 tracks it (its own writes and the renewals' writes)
+    _p4_base = 0  # _ctl_word at P4's last step: a change means _write_tables wrote t_ctl with a renewal's word
+    _p4_prev = False  # the previous forward's identity decision (flips)
+    _p4_h = None  # the open segment (since the last renewal or switch): {T_pad: [identity replays, B replays]}
+    _p4_n = None  # ... [eager forwards, flips, t_ctl writes, of these in a forward whose renewal rewrote t_ctl ('resync')]
+    _p4_from = 0  # the forward the open segment started at
+    _p4_seg = ()  # segments closed since the last renewal: (ident_t, from, to, {T_pad: [id, B]}, counters)
+    _p4_ep = None  # the open epoch (since the last switch): its totals
+    _p4_epochs = ()  # the closed epochs (<CTL_FILE>.p4.rank<r>)
+    _p4_warned = False
+
+    def _p4_step(self, counted: bool, t_pad: int) -> None:
+        """Before this forward's replay, after the renewal's writes: a switch due at this forward, then t_ctl's
+        identity bit. The decision depends on the forward only (counted, T_pad: the same on every attention-DP rank) and on
+        the ident_t in force (switched at an agreed forward); t_ctl is filled only when the word changes."""
+        if self._p4_q and self._p4_q[0][2] is not None and self.forwards >= self._p4_q[0][2]:
+            self._p4_switch()
+        base = self._ctl_word
+        resync = base != self._p4_base
+        if resync:  # _write_tables wrote a renewal's new word (over the identity bit, if it was set)
+            self._p4_base = self._p4_dev = base
+        t, n = self._p4_t, self._p4_n
+        if t >= 0:
+            ident = counted and t_pad <= t
+            if counted:
+                c = self._p4_h.get(t_pad)
+                if c is None:
+                    c = self._p4_h[t_pad] = [0, 0]
+                c[0 if ident else 1] += 1
+            else:
+                n[0] += 1
+            if ident != self._p4_prev:
+                n[1] += 1
+                self._p4_prev = ident
+            word = (base | CTL_IDENTITY_BIT) if ident else base
+        else:
+            word, self._p4_prev = base, False  # off: the renewal's word (restored once)
+        if word != self._p4_dev:
+            self.t_ctl.fill_(word)  # the forward stream, between the previous replay and this one
+            self._p4_dev = word
+            n[2] += 1
+            n[3] += resync
+        if t < 0 and not self._p4_q:
+            self._p4_live = False  # off, restored, nothing pending: the default path from the next forward on
+
+    def _p4_switch(self) -> None:
+        """The oldest pending ident_t takes effect at this forward (its agreed forward; later: late)."""
+        (d, t, at), self._p4_q = self._p4_q[0], self._p4_q[1:]
+        old, late = self._p4_t, self.forwards - at
+        self._p4_close()  # the open segment ends here (into the old epoch's totals)
+        if self._p4_ep is not None:  # the epoch of the old ident_t ends here
+            self._p4_ep["end"] = self.forwards
+            self._p4_epochs = [*self._p4_epochs, self._p4_ep]
+        if old < 0:  # P4 was off: t_ctl holds the renewal's word (restored, or never touched)
+            self._p4_base = self._p4_dev = self._ctl_word
+        self._p4_t = t
+        self._p4_ep = dict(t=t, decision=d, agreed=at, fwd=self.forwards, late=late, h={}, eager=0, flips=0, writes=0,
+                           resync=0, end=None)
+        self._p4_status()
+        if self.ep_rank == 0:
+            logger.info(
+                f"GenEPLB p4 switch @forward {self.forwards} (replay {self.replays}): ident_t {old} -> {t} (decision {d}, "
+                f"agreed forward {at} = MAX apply forward + {P4_MARGIN}, late {late})"
+            )
+
+    def _p4_close(self) -> None:
+        """The open segment ends at this forward: into rank 0's next note and the open epoch's totals."""
+        h, n, ep = self._p4_h, self._p4_n, self._p4_ep
+        if ep is not None and (h or any(n)):
+            self._p4_seg = [*self._p4_seg, (self._p4_t, self._p4_from, self.forwards, h, n)]
+            for T, (a, b) in h.items():
+                c = ep["h"].setdefault(T, [0, 0])
+                c[0] += a
+                c[1] += b
+            for k, v in zip(("eager", "flips", "writes", "resync"), n):
+                ep[k] += v
+        self._p4_h, self._p4_n, self._p4_from = {}, [0, 0, 0, 0], self.forwards
+
+    def _p4_vote(self, f_max: int, decision: int) -> None:
+        """A ready vote's result: the switch its decision scheduled gets the agreed forward."""
+        for e in self._p4_q:
+            if e[0] == decision and e[2] is None:
+                e[2] = f_max + P4_MARGIN
+
+    def _p4_renewal(self, t: int) -> str:
+        """A decision is applied (each rank at its own forward): a changed ident_t is scheduled for the agreed
+        forward of the ready vote this renewal started. -> rank 0's note: the segments since the last renewal ('' before
+        the first switch: the default renewal line)."""
+        if self.t_ctl is None:  # no control word (mode C): ident_t is inert
+            if t >= 0 and not self._p4_warned and self.ep_rank == 0:
+                self._p4_warned = True
+                logger.warning("GenEPLB ctl: ident_t needs cost model B's route kernel (the control word); mode C ignores it")
+            return ""
+        if t != self._p4_want:
+            self._p4_want = t
+            self._p4_q = [*self._p4_q, [self.decisions, t, None]]
+            if self._p4_n is None:
+                self._p4_h, self._p4_n, self._p4_from = {}, [0, 0, 0, 0], self.forwards
+            self._p4_live = True
+        if self._p4_ep is None:
+            return ""
+        self._p4_close()
+        seg, self._p4_seg = self._p4_seg, []
+        if self.ep_rank != 0:
+            return ""
+        return "".join(
+            f" | p4 t={st} fwd {a}-{b}: {' '.join(f'{T}:{h[T][0]}/{h[T][1]}' for T in sorted(h)) or '-'} eager {sn[0]} "
+            f"flips {sn[1]} writes {sn[2]} resync {sn[3]}"
+            for st, a, b, h, sn in seg
+        )
+
+    def _p4_status(self) -> None:
+        """<CTL_FILE>.p4.rank<r>: the closed epochs (rewritten at a switch: tmp + rename)."""
+        import json
+
+        path = f"{CTL_FILE}.p4.rank{self.ep_rank}"
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(dict(rank=self.ep_rank, forwards=self.forwards, replays=self.replays, t=self._p4_t,
+                               margin=P4_MARGIN, epochs=list(self._p4_epochs)), f)
+                f.write("\n")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    _p4_base_ctl_apply = _ctl_apply  # the control apply defined above (core + the other patches' additions)
+
+    def _ctl_apply(self, reply: dict) -> str:
+        """The control apply above, then ident_t (_p4_renewal): -> the renewal line's note."""
+        return self._p4_base_ctl_apply(reply) + self._p4_renewal(self._last["ctl"]["ident_t"])
 
     def _holds_replicas(self) -> bool:
         """Whether any layer has a copy in a spare slot (its layout differs from the home layout)."""
