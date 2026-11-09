@@ -726,6 +726,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # (slots and weights of the routed rows, -1 / 0 past them). The input is then quantized
         # into the staged activation rows inside run_moe (see ``supports_fused_prepare``).
         self._route_stager = None
+        # set with the stager when per-T stream modes are armed:
+        # ``fork(expert_ids, weights, topk_idx_local, topk_weights)`` runs before the input quantize and returns None
+        # (the stager runs after the quantize, as before) or the join that run_moe calls right before the MegaMoE launch
+        # instead of the stager (the route+stage forked to a side stream, and / or a pending statistics join).
+        self._route_stager_fork = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -1953,6 +1958,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if self._route_stager is not None:
             # Quantize into the bucket's activation rows, then route the experts
             # straight into its index / weight rows: no staging copies.
+            # a fork hook may launch the route+stage on a side stream beside the quantize.
+            join = (
+                self._route_stager_fork(topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights)
+                if self._route_stager_fork is not None
+                else None
+            )
             if num_tokens > 0:
                 x_fp4, x_sf = self.quantize_input(x, out=(bufs.activation, bufs.activation_sf))
                 in_place = x_fp4.data_ptr() == bufs.activation.data_ptr()
@@ -1961,7 +1972,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
                 if self.ep_rank == 0:
                     _log_geneplb_staging(launch_max_T, in_place)
-            self._route_stager(topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights)
+            if join is None:
+                self._route_stager(topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights)
+            else:
+                join()  # the forward stream waits for the forked route+stage (and a pending statistics join)
             self._last_staged_T[launch_max_T] = num_tokens
         use_direct_inputs = (
             self._route_stager is None

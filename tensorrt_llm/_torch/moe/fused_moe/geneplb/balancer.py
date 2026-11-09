@@ -280,6 +280,11 @@ class GenEplbLayer:
 class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
     """Model-level owner of the GenEPLB layers, their device tables and the renewal pipeline."""
 
+    # per-T stream modes (lean.py: inline / overlap / stats_side) chosen per
+    # captured CUDA-graph bucket: TLLM_GENEPLB_LEAN / _INLINE_MAX_T / _OVERLAP_MAX_T / _STATS_SIDE / _LEAN_CHECK /
+    # _LEAN_STATUS, read at finalize_model and fixed per GEN lifetime. None: no hook (today's single-stream order).
+    _lean = None
+
     def __init__(self, *, ep_rank: int, ep_size: int, config: Any, mapping: Optional[Any] = None):
         self.ep_rank, self.ep_size = int(ep_rank), int(ep_size)
         self.config, self.mapping = config, mapping
@@ -401,6 +406,11 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         if fx.FABRIC or COPY_FABRIC in self._copy_armed:
             self._fx_finalize()  # collective: every layer's planes are its arena rows
         self.finalized = True
+        # env, dedicated streams / events, every rank's agreement, the MegaMoE fork hooks (collective,
+        # after _init_pipeline and any other finalize hook of the build; nothing runs a forward before it returns).
+        from . import lean
+
+        self._lean = lean.setup(self)
         if self.ep_rank == 0:
             names = ",".join(n for n, _ in self.slot_tensors[0])
             logger.info(
@@ -651,6 +661,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         layer's ids are held and ONE fused count kernel over all layers is captured after the last layer (the
         shipped 'fused_ptr' mode). Eager steps count nothing."""
         staged = layer.index in self.staged
+        if layer.index == 0 and self._lean is not None:  # the forward's T picks its launch order
+            self._lean.begin_forward(int(ids.shape[0]))
         if ids.numel() == 0:
             return ids if staged else ids.to(self.out_dtype)
         if layer.index == 0 or self._rows_ref is None:
@@ -663,12 +675,17 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self._held.setdefault(layer.index, ids)  # the first invocation per forward
             if layer.index == self.num_layers - 1 and len(self._held) == self.num_layers:
                 held = [self._held[li] for li in range(self.num_layers)]
-                self.stats.record_fused(
+                launch = functools.partial(
+                    self.stats.record_fused,
                     [int(t.data_ptr()) for t in held],
                     [int(t.shape[0]) for t in held],
                     self.valid_rows,
                     self.enable,
                 )
+                # stats_side: launched on its own stream and the ids held by lean until the last layer's
+                # run_moe waits for it; otherwise on the forward stream, as shipped.
+                if self._lean is None or not self._lean.stats_fork(launch, held):
+                    launch()
                 self._held = {}  # the launch is recorded; stream order protects the reads
         if staged:
             return ids  # expert ids: the backend's run_moe routes them into its staging (_stage)
@@ -676,9 +693,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             ids, self._tables(layer.index), self._rows_ref, self.valid_rows, self.out_dtype, ctl=self.t_ctl
         )
 
-    def _stage(self, layer: GenEplbLayer, ids, weights, idx_out, w_out) -> None:
-        if self._nan_acc is not None and weights.numel():  # non-finite router weights, every row (capturable)
-            self._nan_acc += (~torch.isfinite(weights)).sum(dtype=torch.int32)
+    def _stage(self, layer: GenEplbLayer, ids, weights, idx_out, w_out, nan_probe: bool = True) -> None:
+        if nan_probe:  # the overlap's fork runs the probe on the forward stream itself
+            self._stage_probe(weights)
         self.kernel.stage(
             ids,
             self._tables(layer.index),
@@ -689,6 +706,12 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             w_out,
             ctl=self.t_ctl,
         )
+
+    def _stage_probe(self, weights) -> None:
+        """the NaN probe: non-finite router weights, every row (capturable). It allocates temporaries, so the
+        per-T overlap mode calls it on the forward stream (beside the forked stage), never on the side stream."""
+        if self._nan_acc is not None and weights.numel():
+            self._nan_acc += (~torch.isfinite(weights)).sum(dtype=torch.int32)
 
     def _tables(self, li: int):
         return native.LayerTables(
