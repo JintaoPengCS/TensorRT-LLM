@@ -104,10 +104,14 @@ def _run_controls(req: dict):
 
 
 def _ef_params(b_params: dict, geo: Geometry) -> dict:
-    key = (int(b_params["T"]), int(geo.ranks), int(geo.local_slots))
+    # a warm-up cost table row (b_params kernel 'warmup': balancer._b_params, costmodel.b_params_for) overlays
+    # its kernel terms (cf, cl, cc, ch, a, tile) on the prior v2 row; act_k / act_lam0 / tile_disp / the placement knobs stay
+    # prior v2's. Any other b_params (params prior / prior_v2): the prior v2 row, as without the micro-benchmark. Cached per row sha.
+    kern = b_params if b_params.get("kernel") == "warmup" else None
+    key = (int(b_params["T"]), int(geo.ranks), int(geo.local_slots), None if kern is None else str(kern["row_sha256"]))
     p = _EF_PARAMS.get(key)
     if p is None:
-        p = _EF_PARAMS[key] = costmodel.params_ef(*key)
+        p = _EF_PARAMS[key] = costmodel.params_ef(*key[:3], kernel=kern)
     return p
 
 

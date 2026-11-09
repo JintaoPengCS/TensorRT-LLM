@@ -1,0 +1,53 @@
+{
+ "schema": "geneplb_costmb_v1",
+ "purpose": "The constants of GenEPLB's warm-up cost-model micro-benchmark (geneplb/costmb.py, run by balancer.before_capture between the CUDA-graph warmup's pass 1 and pass 2): the designs, timing and fit constants of the reference warm-up fitter, with a true hold-out (every 4th design per family, cold-start train fits, refit of the selected model on all designs). Every rank reads this file; the sha256 of the effective configuration (this file + the TLLM_GENEPLB_COSTMB_* env overrides) joins the identity vote.",
+ "designs": {
+  "families": ["pop", "act", "cons", "ties", "fswp", "hot"],
+  "per_family": 32,
+  "seed": 20261102,
+  "attempts": 20,
+  "holdout_every": 4,
+  "source": "6 families x 32 = 192 designs per tier, seed 20261102, 20 attempts; holdout_every 4 = the true hold-out (costmb.py make_designs: holdout = index % 4 == 3, i.e. 8 of 32 per family). _fix_total keeps the EP*T*K largest slots when a design has more active slots than routes (EP16 M28 T4 would otherwise raise 'no slot left'; never triggers at the reference golden geometries)."
+ },
+ "timing": {
+  "warm": 2,
+  "timed": 8,
+  "reps": 2,
+  "layers": 4,
+  "sleep_min_ms": 5.0,
+  "sleep_host_factor": 2.0,
+  "sleep_calibration_cycles": 2000000,
+  "host_probe_launches": 4,
+  "cap_s": 240.0,
+  "source": "per design and rep: device sleep >= sleep_host_factor x (warm + timed) x the slowest rank's host enqueue ms, 2 warm launches, CUDA event, 8 timed launches, CUDA event; the first 4 staged layers launched in turn; 2 reps in a seed-shared order. cap_s: the rank-identical wall cap, decided once from the all-gathered host enqueue / launch ms of the fixed warm launches before the first timed launch: over the cap reps drop to 1, then the tiers past the cap (configured order) take their fallback rows."
+ },
+ "fit": {
+  "taus": [0.05, 0.5, 1.0, 2.0, 4.0],
+  "tau_hard": 0.06,
+  "starts": 6,
+  "iters": 200,
+  "rows_unit": 1000.0,
+  "select_tol": {"32": 0.1, "64": 0.2, "128": 0.1},
+  "select_tol_default": 0.05,
+  "pin_min_crossing_designs": 1,
+  "source": "forms base / hot, weights >= 0, damped Gauss-Newton with a tau homotopy 4 -> 0.05 from 6 starts; candidates base and hot at tau 0.05 (the hard max) and hot at each LSE tau; select_tol per B preset tier = costmodel.tier_of(T). Selection and acceptance on the TRUE hold-out (costmb.py fit_models): every candidate fitted on the train designs only from the cold starts, the lowest hold-out RMSE, then the smallest-tau LSE model within select_tol of it, refitted on all designs. pin_min_crossing_designs: a tier where fewer designs than this have a slot above one tile (EP x T <= tile: Lt = H = 0 everywhere) cannot identify cl / ch; they are pinned to the nearest accepted identifiable tier of the same bucket, else to the tier's fallback row."
+ },
+ "accept": {
+  "bar_abs_us": 3.0,
+  "bar_rel": 0.05,
+  "bounds": {
+   "cf": [1.0, 20.0],
+   "cl": [0.0, 10.0],
+   "cc": [0.0, 0.05],
+   "ch": [0.0, 10.0]
+  },
+  "source": "hold-out RMSE <= max(3 us, 5 % of the mean y) (an in-sample bar of max(2 us, 3 %) accepts fits whose hold-out error is larger: EP32 T128 fits have a hold-out CV of 3.1-4.9 us) and the coefficient bounds (cl lower bound 0); a tier failing either takes its sealed fallback row on every rank."
+ },
+ "tiers": {
+  "ep16": [32, 64, 96, 128, 160, 192, 384],
+  "ep32": [8, 16, 32],
+  "default_max_tiers": 6,
+  "source": "the decode buckets of the tuned deployments (rows per rank = CUDA-graph batch x 4 with a 3-token draft): GEN DEP16 b8..b48 -> T 32..192 (bucket 256) plus one bucket-512 tier (b96 -> T 384); GEN DEP32 b2..b8 -> T 8 / 16 / 32. Tiers above the largest decode graph's T are dropped (rank-identical: every rank captures the same graphs). Another EP: the decode graphs' T values >= 8, thinned to default_max_tiers. TLLM_GENEPLB_COSTMB_TIERS=<t,t,..> overrides (kept as given). A tier must lie strictly below its MegaMoE launch bucket (T == bucket would take the direct-input path that B never uses)."
+ },
+ "tile_rows_default": 256
+}

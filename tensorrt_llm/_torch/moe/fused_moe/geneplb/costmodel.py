@@ -77,10 +77,12 @@ def tier_v2(T: int, keys) -> int:
     return max([k for k in keys if k <= T] or [min(keys)])
 
 
-def params_ef(T: int, ranks: int, local_slots: int) -> dict:
+def params_ef(T: int, ranks: int, local_slots: int, kernel: Optional[dict] = None) -> dict:
     """The eF model of T tokens per rank (the balancer's T) at EP ``ranks`` with ``local_slots`` slots per rank: the prior v2
     row (sealed params dict).  Raises when the file has no row set for this EP / slot geometry (never a silent EP32 row at
-    EP16, the shipped prior's flaw)."""
+    EP16, the shipped prior's flaw).  ``kernel``: a warm-up cost table row (b_params_for(..., 'warmup')) whose
+    kernel terms cf / cl / cc / ch / a and tile replace the row's; act_k / act_lam0 / tile_disp / the placement knobs stay prior
+    v2's (a kernel micro-benchmark cannot observe the routing's per-replay activity).  None: the prior v2 row, unchanged."""
     raw = _prior_v2_raw()
     table = json.loads(raw)
     sec = table.get("ep%d" % int(ranks))
@@ -110,6 +112,14 @@ def params_ef(T: int, ranks: int, local_slots: int) -> dict:
     out.update({k: float(e[k]) for k in ("cf", "cl", "cc", "ch", "a")})
     dflt = table.get("defaults", {})
     out.update({k: float(e.get(k, sec.get(k, dflt.get(k, v)))) for k, v in EF_DEFAULTS.items()})
+    if kernel is not None:  # the warm-up row's kernel terms over the prior v2 row
+        out.update({k: float(kernel[k]) for k in ("cf", "cl", "cc", "ch", "a")})
+        out.update(
+            tile_rows=int(kernel["tile_rows"]),
+            source="prior_v2+" + str(kernel.get("source", "warmup")),
+            kernel_sha256=str(kernel.get("row_sha256") or kernel.get("sha256")),
+            kernel_tier=int(kernel.get("tier", kernel["T"])),
+        )
     return sealed(out)
 
 
@@ -382,3 +392,137 @@ def layer_us(model: dict, cbar, phys, w, ranks: int) -> float:
     if is_b(model):
         return float(gate_us_B(model, slot_rows(cbar, phys, w).reshape(1, -1), ranks)[0])
     return layer_us_T(model, cbar, phys, w, ranks)
+
+
+# ================================================================================================ cost table
+# The warm-up micro-benchmark's sealed cost table (costmb.py via balancer.before_capture: rank 0 fits, broadcasts the pickled
+# table, every rank re-seals it, the sha is voted) and every renewal's B parameters (balancer._b_params, control field params).
+# One sealed row per T tier: the fitted kernel terms of the tier's MegaMoE launch bucket, or the tier's sealed fallback row (prior
+# v2's kernel terms of the geometry, else the v1 prior's, flagged geometry_mismatch). ONE tier rule, P5's (tier_v2), applied within
+# T's launch bucket: the largest tier <= T, below the bucket's smallest tier the smallest; a T whose bucket holds no tier takes its
+# fallback row. A row has every key cost model B prices with (B_KEYS, T); b_params_for adds T (the balancer's), kernel (P5's
+# overlay trigger) and row_sha256 (the renewal's plan digest).
+TABLE_SCHEMA = "geneplb_costmodel_b_table_v1"
+FALLBACK_TAU = 0.5  # a fallback row's LSE tau (the v1 prior rows' tau; prior v2 rows carry none; B polishes LSE for tau > 0.06)
+PARAMS_SOURCES = ("prior", "prior_v2", "warmup")
+_TABLE_KEYS = ("schema", "tiers", "rows", "outcome", "sha256")
+
+
+def bucket_of(T: int, buckets) -> Optional[int]:
+    """The MegaMoE launch bucket of T rows (mega_moe_cute_dsl._select_launch_max_tokens: the smallest rung >= T; the top one above
+    it), None without a ladder."""
+    b = sorted(int(x) for x in buckets or ())
+    if not b:
+        return None
+    return next((x for x in b if int(T) <= x), b[-1])
+
+
+def prior_files_sha() -> dict:
+    """sha256 of the two prior files a fallback row reads (the micro-benchmark's identity vote)."""
+    return dict(
+        prior_sha256=hashlib.sha256(_prior_raw()).hexdigest(),
+        prior_v2_sha256=hashlib.sha256(_prior_v2_raw()).hexdigest(),
+    )
+
+
+def fallback_row(T: int, ranks: int, local_slots: int, bucket=None, tile_rows: int = TILE_ROWS) -> dict:
+    """The sealed fallback row of tier T at EP ``ranks`` x ``local_slots``: prior v2's kernel terms (cf, cl, cc, ch, a) of the
+    geometry's row of T (tier_v2) with tau FALLBACK_TAU; without prior v2 rows for the geometry, the v1 prior's row of T flagged
+    geometry_mismatch. A function of the files and the arguments only (rank-identical)."""
+    raw = _prior_v2_raw()
+    sec = json.loads(raw).get("ep%d" % int(ranks))
+    if sec is not None and int(sec.get("local_slots", -1)) == int(local_slots):
+        keys = sorted(int(k) for k in sec["rows"])
+        tier = tier_v2(int(T), keys)
+        e = sec["rows"][str(tier)]
+        out = dict(
+            schema=PARAMS_SCHEMA, source="fallback", kernel="prior_v2", model="prior_v2", form="hot",
+            cf=float(e["cf"]), cl=float(e["cl"]), cc=float(e["cc"]), ch=float(e["ch"]), a=float(e["a"]), tau=FALLBACK_TAU,
+            v2_tier=int(tier), prior_v2_sha256=hashlib.sha256(raw).hexdigest(),
+        )
+    else:
+        p = prior_params(int(T))
+        out = dict(
+            schema=PARAMS_SCHEMA, source="fallback", kernel="prior", model=p["model"], form="hot", cf=p["cf"], cl=p["cl"],
+            cc=p["cc"], ch=p["ch"], a=p["a"], tau=p["tau"], prior_key=p["prior_key"], prior_sha256=p["prior_sha256"],
+            geometry_mismatch=True,
+        )
+    out.update(
+        tau_hard=TAU_HARD, tile_rows=int(tile_rows), T=int(T), tier=int(T), bucket=None if bucket is None else int(bucket),
+        ranks=int(ranks), slots_per_rank=int(local_slots),
+    )
+    return sealed(out)
+
+
+def make_table(rows: dict, outcome: dict, **meta) -> dict:
+    """A sealed cost table: rows {T: sealed row}, outcome {T: 'warmup' | 'fallback'} and the meta (geometry, ladder, protocol)."""
+    keys = sorted(int(k) for k in rows)
+    rows = {int(k): v for k, v in rows.items()}
+    outcome = {int(k): v for k, v in outcome.items()}
+    t = dict(
+        schema=TABLE_SCHEMA, tiers=keys, rows={str(k): rows[k] for k in keys}, outcome={str(k): str(outcome[k]) for k in keys}
+    )
+    t.update(meta)
+    return sealed(t)
+
+
+def fallback_table(ranks: int, local_slots: int, tiers=(), buckets=(), tile_rows: int = TILE_ROWS, **meta) -> dict:
+    """Every tier's fallback row: the table EVERY rank takes when the micro-benchmark fails anywhere."""
+    buckets = sorted(int(b) for b in buckets or ())
+    rows = {int(T): fallback_row(T, ranks, local_slots, bucket_of(T, buckets), tile_rows) for T in tiers}
+    return make_table(
+        rows, {T: "fallback" for T in rows}, ranks=int(ranks), local_slots=int(local_slots), buckets=buckets,
+        tile_rows=int(tile_rows), **meta
+    )
+
+
+def table_meta(table: dict) -> dict:
+    return {k: v for k, v in table.items() if k not in _TABLE_KEYS}
+
+
+def fallback_like(table: dict) -> dict:
+    """The fallback table of a table's tiers and meta (its sha is what a forced fallback of the same run produces)."""
+    m = table_meta(table)
+    ranks, slots, buckets = m.pop("ranks"), m.pop("local_slots"), m.pop("buckets")
+    return fallback_table(ranks, slots, table.get("tiers") or (), buckets, m.pop("tile_rows", TILE_ROWS), **m)
+
+
+def table_ok(table: dict) -> bool:
+    """The table and every row hash to their recorded sha256 (a table that travelled through a pickle)."""
+    rows = table.get("rows") or {}
+    return params_sha(table) == table.get("sha256") and all(params_sha(r) == r.get("sha256") for r in rows.values())
+
+
+def table_row(table: dict, T: int) -> Optional[dict]:
+    """The table's row of T: tier_v2 over the tiers of T's launch bucket; None when no tier of the table is in that bucket."""
+    rows = table.get("rows") or {}
+    b = bucket_of(T, table.get("buckets"))
+    keys = sorted(int(k) for k, r in rows.items() if r.get("bucket") == b)
+    return rows[str(tier_v2(int(T), keys))] if keys else None
+
+
+def b_params_for(source: str, T: int, table: Optional[dict], ranks: int, local_slots: int) -> dict:
+    """B's parameters of a renewal at T (the balancer's T) from ``source``:
+      prior     prior_params(T) itself: the shipped b_params (P5 then prices with the prior v2 row)
+      prior_v2  prior v2's kernel terms of the geometry as a B row (fallback_row(T)); P5: the prior v2 row
+      warmup    the table's row of T (table_row; a T whose bucket holds no tier: its fallback row); P5: the row's kernel terms
+                over the prior v2 row (params_ef(..., kernel=), planner._ef_params)
+    The result is sealed and carries row_sha256 (the renewal's plan digest) and kernel (P5's overlay trigger: 'warmup')."""
+    T = max(1, int(T))
+    if source == "prior":
+        return prior_params(T)
+    if source == "prior_v2":
+        row = fallback_row(T, ranks, local_slots)
+        extra = dict(kernel="prior_v2", source="prior_v2")
+    elif source == "warmup":
+        if table is None:
+            raise ValueError("cost table: params source warmup without a table")
+        row = table_row(table, T)
+        if row is None:
+            row = fallback_row(T, ranks, local_slots, bucket_of(T, table.get("buckets")), table.get("tile_rows", TILE_ROWS))
+        extra = dict(kernel="warmup")
+    else:
+        raise ValueError("cost model B params source %r: one of %s" % (source, PARAMS_SOURCES))
+    out = {k: v for k, v in row.items() if k != "sha256"}
+    out.update(extra, T=T, row_sha256=row["sha256"])
+    return sealed(out)

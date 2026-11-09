@@ -209,8 +209,13 @@ class DecoderCudaGraphs:
         context_promotion_supported: bool,
         warmup_inputs: torch.Tensor | None = None,
         inputs: DecoderInputPreparer | None = None,
+        moe_load_balancer: Any = None,
+        warmup_timer: Any = None,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
+        # GenEPLB's warm-up cost-model micro-benchmark hooks (_geneplb_hook).
+        self._moe_load_balancer = moe_load_balancer
+        self._warmup_timer = warmup_timer
         self._inputs = inputs
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
         self._config = config
@@ -354,12 +359,36 @@ class DecoderCudaGraphs:
                 self.run_cuda_graph_warmup(resource_manager)
             finally:
                 self.cuda_graph_runner.is_warmup_only = False
+            # GenEPLB's warm-up cost-model micro-benchmark: after pass 1 resolved every decode bucket's MegaMoE
+            # tactic and fenced its workspaces, before any capture (its eager launches rewrite the buckets' staging rows).
+            self._geneplb_hook("before_capture")
             self.reset_padding_dummies()
             # Captured graphs keep the MoE communication timeouts that were
             # current at capture, and serving replays them, so capture with the
             # serving timeouts. The warmup-only pass above keeps the warmup ones.
             with moe_comm_serving_timeouts():
                 self.run_cuda_graph_warmup(resource_manager)
+            # the tactic every captured decode bucket baked in == the one the micro-benchmark fitted.
+            self._geneplb_hook("after_capture")
+
+    def _geneplb_hook(self, name: str) -> None:
+        """balancer.before_capture / after_capture (GenEPLB cost model B's warm-up
+        micro-benchmark); a no-op without such a balancer. Collective on every rank: every rank runs the same warmup."""
+        hook = getattr(self._moe_load_balancer, name, None)
+        if hook is None:
+            return
+        try:
+            tokens_per_step = int(self.get_runtime_tokens_per_gen_step(self._config.max_draft_len))
+        except Exception:  # noqa: BLE001 -- the tiers are voted; a rank without it measures nothing (the fallback)
+            tokens_per_step = 1
+        hook(
+            purpose=getattr(self._warmup_timer, "purpose", None),
+            graphs_enabled=bool(self.cuda_graph_runner.enabled),
+            graph_batch_sizes=sorted(int(b) for b in (self._config.cuda_graph_batch_sizes or ())),
+            max_batch_size=int(self._config.max_batch_size),
+            tokens_per_step=tokens_per_step,
+            graphs_captured=len(getattr(self.cuda_graph_runner, "graphs", None) or ()),
+        )
 
     def _prepare_capture_batch(
         self,

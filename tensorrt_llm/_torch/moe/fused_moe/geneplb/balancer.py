@@ -98,8 +98,24 @@ CTL_SPEC = (
     # placement=flex is inert (lpt) unless objective=ef and pad=drop. Cost model B only (mode C ignores both).
     ("objective", {"shipped": 0, "ef": 1}, 0),  # shipped cost model B on the window means | P5 eF (expected-max) objective
     ("placement", {"lpt": 0, "flex": 1}, 0),  # shipped rows-LPT | P6 flex options (every rank's 2 busiest homes)
+    # the source of cost model B's parameters (share solver, install gate, P5's kernel
+    # terms) from the next renewal on: prior (the shipped prior_params) | prior_v2 (prior v2's kernel terms of the geometry)
+    # | warmup (the warm-up micro-benchmark's sealed table, costmb.py); default: TLLM_GENEPLB_PARAMS. The MAX over ranks rules.
+    ("params", {"default": -1, "prior": 0, "prior_v2": 1, "warmup": 2}, -1),
 )
 CTL_DEFAULT = tuple(float(d) for _, _, d in CTL_SPEC)
+# the warm-up cost-model micro-benchmark (costmb.py; balancer.before_capture, called by
+# graphs.py between the decode-graph warmup's pass 1 and pass 2 of the final-executor warmup, once; after_capture re-checks the
+# captured tactic):
+#   TLLM_GENEPLB_COSTMB=1      measure once at startup; DEFAULT OFF (unset / 0: never measure, no table; params warmup / auto
+#                              then run prior = the shipped parameters, i.e. exactly the behaviour without it)
+#   TLLM_GENEPLB_PARAMS=auto | prior | prior_v2 | warmup   the source when the control file has no params field (auto: the
+#                              table when one was measured, else prior)
+#   TLLM_GENEPLB_COSTMB_TIERS / _BAR_US / _BAR_REL / _CAP_S / _PER_FAMILY / _REPS / _DIR   costmb.py
+COSTMB_ON = os.environ.get("TLLM_GENEPLB_COSTMB", "0").strip() == "1"
+PARAMS_DEFAULT = os.environ.get("TLLM_GENEPLB_PARAMS", "auto").strip().lower()
+if PARAMS_DEFAULT not in ("auto", "prior", "prior_v2", "warmup"):
+    raise ValueError(f"TLLM_GENEPLB_PARAMS={PARAMS_DEFAULT!r}: one of auto, prior, prior_v2, warmup")
 CTL_PAD_WORD = {"spread": 0, "drop": 1, "stock": 2}  # l3b_route_kernels.cu LB_PAD_* (control word bits 0-1)
 CTL_IDENTITY_BIT = 4  # l3b_route_kernels.cu LB_CTL_IDENTITY
 
@@ -147,6 +163,7 @@ def ctl_fields(codes) -> dict:
         copy="fabric" if c["copy"] >= 1 else "nccl",
         objective="ef" if c["objective"] >= 1 else "shipped",
         placement="flex" if c["placement"] >= 1 else "lpt",
+        params=None if c["params"] < 0 else ("prior", "prior_v2", "warmup")[min(2, int(c["params"]))],
     )
 
 
@@ -156,7 +173,8 @@ def ctl_text(f: dict) -> str:
         f"install={f['install']} min_t={f['min_t']} guard_t={f['guard_t']} pad={f['pad']} identity={f['identity']} "
         f"gate_tau={'prior' if f['gate_tau'] is None else repr(f['gate_tau'])} gate_margin_us={f['gate_margin_us']!r} "
         f"gate_hyst={f['gate_hyst']} gate_horizon={'fixed' if f['gate_horizon'] is None else f['gate_horizon']} "
-        f"copy={f['copy']} objective={f['objective']} placement={f['placement']}"
+        f"copy={f['copy']} objective={f['objective']} placement={f['placement']} "
+        f"params={'default' if f['params'] is None else f['params']}"
     )
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
@@ -788,7 +806,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 li for li, at in self.installed_at.items() if self.decisions - at < LIVE_COOLDOWN
             ]
         geo = self.geo
-        b_params = costmodel.prior_params(max(1, tokens)) if self.mode == "B" else None
+        b_params = self._b_params(max(1, tokens), ctl) if self.mode == "B" else None  # params source
         install = not (self.live and tokens < LIVE_MIN_T)
         self._last = dict(n_rem=n_rem, tokens=tokens, install=install)
         if ctl is not None:  # the guard on the real or padded T against min_t, freeze / identity, the horizon
@@ -876,7 +894,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             + ((tuple(ins["sources"]),) if "sources" in ins else ())  # the sources are agreed too
             for ins in reply["installs"]
         ]
-        key = hashlib.blake2b(repr((self.decisions, chunk, plan)).encode(), digest_size=8).digest()
+        key = hashlib.blake2b(
+            repr((self.decisions, chunk, plan, self._b_row_sha)).encode(), digest_size=8
+        ).digest()  # the renewal's parameter row sha
         digest = float(int.from_bytes(key, "little") >> 12)  # 52 bits: exact in a float64
         d = float(self.decisions)
         if reply["installs"] and self._copy_mode == COPY_FABRIC:  # copy now, agree in the vote
@@ -890,6 +910,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             chunk,
         )
         note = self._ctl_apply(reply) if self._last.get("ctl") is not None else ""
+        note += self._b_note  # the renewal's params source and row (rank 0's renewal line)
         if self.ep_rank == 0:
             logger.info(
                 f"GenEPLB renewal {self.renewals} @replay {self.replays}: mode {self.mode}, T {self._last['tokens']}"
@@ -1460,6 +1481,68 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 f"gate estimate {self.c_gpu_ms:.3f} "
                 f"(median of {len(self.copy_ms_history)})"
             )
+
+    # ------------------------------------------------------------------ the warm-up cost-model micro-benchmark
+    # cost_table: the sealed table costmb.run measured (rank-identical: broadcast, sha-voted; the fallback table on any failure),
+    # None until before_capture ran (or without TLLM_GENEPLB_COSTMB=1 / mode C). _b_row_sha / _b_note: the last renewal's
+    # parameter row sha (plan digest) and its renewal-line note.
+    cost_table = None
+    _costmb_state = None  # None | 'measured' | 'checked'
+    _costmb_report = None
+    _costmb_recorder = None
+    _b_row_sha = None
+    _b_note = ""
+
+    def before_capture(self, *, purpose=None, **graph) -> None:
+        """graphs.py DecoderCudaGraphs.warmup_and_capture, after the decode-graph warmup's pass 1 (every decode bucket's MegaMoE
+        tactic resolved, its workspace pairing fenced) and before any capture: the warm-up micro-benchmark, once per process, in
+        the final-executor warmup only (the memory-profiling warmup's KV cache is discarded). Collective on every rank: every
+        condition below is rank-identical (configuration, warmup sequence)."""
+        if (not self.finalized or self.mode != "B" or not COSTMB_ON or purpose == "memory_profiling"
+                or self._costmb_state is not None or torch.cuda.is_current_stream_capturing()):
+            return
+        from . import costmb
+
+        self._costmb_state = "measured"
+        self.cost_table, self._costmb_report = costmb.run(self, purpose=purpose, **graph)
+        if self.staged:
+            try:  # records the runners pass 2 captures (after_capture compares their tactic with the fitted rows')
+                layer = next(li for li in self.layers if li.index in self.staged)
+                self._costmb_recorder = costmb.CaptureRecorder(costmb.GpuEnv.load(), layer.moe.backend, self.geo.top_k)
+            except Exception as exc:  # noqa: BLE001 -- after_capture then checks the cached runners instead
+                self._costmb_recorder = None
+                logger.warning(f"GenEPLB rank {self.ep_rank}: costmb capture recorder unavailable ({exc!r})")
+
+    def after_capture(self, *, purpose=None, **graph) -> None:
+        """graphs.py, after pass 2 captured the decode graphs: every fitted tier's tactic label == the captured graphs' (any
+        mismatch anywhere: the fallback table on every rank). Collective on every rank; once."""
+        if self._costmb_state != "measured" or purpose == "memory_profiling":
+            return
+        from . import costmb
+
+        self._costmb_state = "checked"
+        rec, self._costmb_recorder = self._costmb_recorder, None
+        if rec is not None:
+            rec.remove()
+        self.cost_table, rep = costmb.after_capture(self, self.cost_table, rec, purpose=purpose, **graph)
+        if self._costmb_report is not None:
+            self._costmb_report["capture"] = rep
+
+    def _b_params(self, tokens: int, ctl) -> dict:
+        """This renewal's B parameters: the control field params (no control file / 'default': TLLM_GENEPLB_PARAMS) resolved
+        against the warm-up table (auto: warmup with a table, else prior; warmup without a table: prior). Rank-identical: the
+        gathered MAX of the codes and the voted table."""
+        want = (ctl or {}).get("params") or PARAMS_DEFAULT
+        src = want
+        if src == "auto":
+            src = "warmup" if self.cost_table is not None else "prior"
+        elif src == "warmup" and self.cost_table is None:
+            src = "prior"
+        b = costmodel.b_params_for(src, tokens, self.cost_table, self.geo.ranks, self.geo.local_slots)
+        self._b_row_sha = str(b.get("row_sha256") or b["sha256"])
+        tier = f" tier {b['tier']} {b.get('source')}" if src == "warmup" else ""
+        self._b_note = f" | params {want}->{src} row {self._b_row_sha[:12]}{tier}"
+        return b
 
     def shutdown(self, local_safe: bool = True) -> bool:
         if self.is_shutdown:
