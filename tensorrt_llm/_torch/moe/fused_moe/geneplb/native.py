@@ -160,6 +160,8 @@ def load_extension(
                     want["LAYERS"] = layers
             else:
                 want.update(PAD_K=top_k, PAD_PHASE=experts // ranks, BLOCK=BLOCK, **WEYL)
+                if variant == "B":
+                    want["CTL"] = 1  # the control-word entries
             for k, v in want.items():
                 if getattr(ext, k, None) != v:
                     raise RuntimeError(
@@ -279,13 +281,15 @@ class RouteKernel:
         rows_ref: int,
         valid_rows: Optional[torch.Tensor],
         out_dtype: torch.dtype = torch.int32,
+        ctl: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Slot ids [rows, top_k] (out_dtype int32 | int64) of ``ids`` (int32 [rows, top_k], this rank's rows).
 
         rows_ref: rows of the main pass of this forward (layer 0's first launch; >= rows: the MTP layer's re-entries
         have fewer rows and their padding limit scales by rows / rows_ref). valid_rows: int32 [1] device word, the real
         rows of the main pass (>= rows_ref, e.g. VALID_ALL: no padding rows); None = no padding rule. An expert id
-        outside [0, experts) maps to the sentinel slot id ``slots``.
+        outside [0, experts) maps to the sentinel slot id ``slots``. ctl: int32 [1] control word read
+        at replay time (B only: padding mode, identity; l3b_route_kernels.cu lb_ctl_*); None = the shipped launch.
         """
         self._check(ids, tables)
         if out_dtype not in (torch.int32, torch.int64):
@@ -341,6 +345,8 @@ class RouteKernel:
             valid_rows if pad else self._zero,
             pad,
             out,
+            ctl if ctl is not None else self._zero,
+            ctl is not None,
         )
         return out
 
@@ -353,6 +359,7 @@ class RouteKernel:
         idx_out: torch.Tensor,
         w_in: torch.Tensor,
         w_out: torch.Tensor,
+        ctl: Optional[torch.Tensor] = None,
     ) -> None:
         """B's route written straight into a MegaMoE bucket's staging (the shipped stage cut): idx_out [bucket,
         top_k] gets the slots of ``ids``' rows and -1 past them, w_out [bucket, >= top_k] (unit column stride)
@@ -375,6 +382,8 @@ class RouteKernel:
             idx_out,
             w_in,
             w_out,
+            ctl if ctl is not None else self._zero,
+            ctl is not None,
         )
 
 

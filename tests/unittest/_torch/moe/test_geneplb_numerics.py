@@ -484,7 +484,7 @@ GEOMETRIES = ((384, 32, 16, 6), (384, 16, 32, 6), (384, 16, 28, 6), (256, 4, 68,
 def test_route_host_logic_generic_geometry(geo, tmp_path):
     """The kernels' [l3-host] / [l3b-host] logic (the C kernel's and the B kernel's host emulations, the same
     __host__ __device__ functions the device code calls) compiled for each geometry, against ref_route; the device
-    kernels compile there too (g++ with CUDA built-in stubs)."""
+    kernels compile there too (g++ with CUDA built-in stubs), the B kernels with and without the control word."""
     experts, ranks, local, top_k = geo
     slots_total = ranks * local
     cu_c = (GENEPLB_DIR / "csrc" / "l3_pad_route_kernels.cu").read_text()
@@ -492,6 +492,7 @@ def test_route_host_logic_generic_geometry(geo, tmp_path):
     region = _section(cu_c, "// [l3-host-begin]", "// [l3-host-end]")
     assert region == _section(cu_b, "// [l3-host-begin]", "// [l3-host-end]")
     l3b = _section(cu_b, "// [l3b-host-begin]", "// [l3b-host-end]")
+    ctl = _section(cu_b, "namespace {\nconstexpr int LB_CTL_PAD", "}  // namespace\n")
     defines = (
         f"#define GENEPLB_E {experts}\n#define GENEPLB_SLOTS {slots_total}\n#define GENEPLB_RANKS {ranks}\n"
         f"#define GENEPLB_TOPK {top_k}\n"
@@ -515,12 +516,12 @@ def test_route_host_logic_generic_geometry(geo, tmp_path):
         )
         + _section(
             cu_b,
-            "template<typename OutT>\n__global__ void __launch_bounds__(MB_TPB) l3b_mb_k(",
+            "template<typename OutT,bool CTL>\n__global__ void __launch_bounds__(MB_TPB) l3b_mb_k(",
             "\n}\n",
         )
         + _section(
             cu_b,
-            "template<typename OutT>\n__global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(",
+            "template<typename OutT,bool CTL>\n__global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(",
             "\n}\n",
         )
     )
@@ -537,10 +538,13 @@ def test_route_host_logic_generic_geometry(geo, tmp_path):
         + "\n"
         + l3b
         + "\n"
+        + ctl
+        + "\n"
         + asserts
         + kernels
-        + "int main(){auto a=&l3_pad_route_k<false>;auto b=&l3b_mb_k<int>;auto c=&l3b_mb_k<int64_t>;"
-        "auto d=&l3b_mbs_k<int64_t>;return (int)(sizeof(a)+sizeof(b)+sizeof(c)+sizeof(d))*0;}\n"
+        + "int main(){auto a=&l3_pad_route_k<false>;auto b=&l3b_mb_k<int,false>;auto c=&l3b_mb_k<int64_t,false>;"
+        "auto d=&l3b_mbs_k<int64_t,false>;auto e=&l3b_mb_k<int,true>;auto f=&l3b_mbs_k<int64_t,true>;"
+        "return (int)(sizeof(a)+sizeof(b)+sizeof(c)+sizeof(d)+sizeof(e)+sizeof(f))*0;}\n"
     )
     done = subprocess.run(
         [

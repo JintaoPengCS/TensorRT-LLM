@@ -436,6 +436,32 @@ inline void l3b_stage_emulate(const int* ids,int n,int first,int ep_rank,const i
 }  // namespace
 // [l3b-host-end]
 
+// The control word of a CTL launch (balancer t_ctl, written on the forward stream between two
+// replays together with a renewal's tables): bits 0-1 the padding mode of the padding elements (f >= first): LB_PAD_SPREAD 0 the shipped
+// pad_expert rule, LB_PAD_DROP 1 the invalid expert LR_E, i.e. the sentinel slot LR_SLOTS (MegaMoE's router sends any id >= its expert
+// count to the trash bucket, token_comm.py _load_router_inputs) and weight 0 in the staged weights, LB_PAD_STOCK 2 the element's own id
+// (as a launch without the padding word); bit 2 LB_CTL_IDENTITY: every id to its home slot (e / homes) x local slots + e % homes (the
+// stock expert -> rank map) on the fast path, whatever the tables hold (replicas unused). A launch without the word (CTL false) is the
+// shipped kernel. Host-compilable (tests).
+namespace {
+constexpr int LB_CTL_PAD=3,LB_PAD_SPREAD=0,LB_PAD_DROP=1,LB_PAD_STOCK=2,LB_CTL_IDENTITY=4;
+constexpr int LB_HOMES=LR_E/GENEPLB_RANKS,LB_LOCAL=LR_SLOTS/GENEPLB_RANKS;
+static_assert(LB_HOMES*GENEPLB_RANKS==LR_E&&LB_LOCAL*GENEPLB_RANKS==LR_SLOTS&&LB_HOMES<=LB_LOCAL,
+              "every rank holds its homes in its first local slots (geometry.home_slot)");
+__host__ __device__ __forceinline__ int lb_home_slot(int e){ return (e<0||e>=LR_E)?LR_SLOTS:(e/LB_HOMES)*LB_LOCAL+e%LB_HOMES; }
+// The logical expert of padding element f under padding mode pm (raw: its router id).
+__host__ __device__ __forceinline__ int lb_ctl_pad_expert(int f,int first,int ep_rank,int raw,int pm){
+ return pm==LB_PAD_DROP?LR_E:(pm==LB_PAD_STOCK?lr_sanitize(raw):pad_expert(f,first,ep_rank));
+}
+// lb_stage_store with the weight of a dropped padding element stored as 0.
+template<typename OutT>
+__host__ __device__ __forceinline__ void lb_ctl_stage_store(int f,int n,int total,int ld,int slot,const float* w_in,OutT* idx_out,
+  float* w_out,bool drop){
+ if(f<n){idx_out[f]=(OutT)slot;w_out[(f/PAD_K)*ld+f%PAD_K]=drop?0.0f:w_in[f];}
+ else if(f<total){idx_out[f]=(OutT)(-1);w_out[(f/PAD_K)*ld+f%PAD_K]=0.0f;}
+}
+}  // namespace
+
 namespace {
 constexpr int K=GENEPLB_TOPK;            // top-k of DeepSeek-V4-Pro
 constexpr int MAX_ROWS=1<<16;            // host cap on rows per launch
@@ -448,10 +474,13 @@ void ck(const torch::Tensor&t,torch::ScalarType d){
   "current-device contiguous tensor required");}
 
 // route_b: ceil(n / MB_TPB) blocks of MB_TPB threads; block = tile q of rule block b.
-template<typename OutT>
+// CTL true: the launch also reads the control word ctl_g (padding mode, identity: lb_ctl_*); CTL false is the kernel
+// without the control word (ctl_g never read).
+template<typename OutT,bool CTL>
 __global__ void __launch_bounds__(MB_TPB) l3b_mb_k(const int* __restrict__ ids,int n,int ep_rank,
   const int* __restrict__ counts_g,const int* __restrict__ starts_g,const int* __restrict__ slots_g,
-  const int* __restrict__ cumw_g,const int* __restrict__ wmode_g,OutT* __restrict__ out,int rows_ref,const int* __restrict__ valid_rows){
+  const int* __restrict__ cumw_g,const int* __restrict__ wmode_g,OutT* __restrict__ out,int rows_ref,const int* __restrict__ valid_rows,
+  const int* __restrict__ ctl_g){
  __shared__ int counts[LR_E];
  __shared__ int starts[LR_E];
  __shared__ int slots[LR_SLOTS];
@@ -462,6 +491,7 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mb_k(const int* __restrict__ ids,i
  const int t=threadIdx.x,lane=t&31,w=t>>5;
  const int b=blockIdx.x/MB_TILES,q=blockIdx.x%MB_TILES,base=b*LR_BLOCK;
  int vr=(valid_rows!=nullptr)?*valid_rows:0;                  // LOAD: every global word, issued before the first use
+ const int ctl=CTL?*ctl_g:0;                                  // the control word: block-uniform
  int raw[MB_TILES];
 #pragma unroll
  for(int i=0;i<MB_TILES;++i){int f=base+t+MB_TPB*i;raw[i]=(f<n)?ids[f]:LR_E;}
@@ -474,9 +504,11 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mb_k(const int* __restrict__ ids,i
  }
  int wmode=*wmode_g;                                          // block-uniform: one word per layer
  int first=(valid_rows!=nullptr)?lb_pad_first(vr,n/PAD_K,rows_ref):n;
+ const int pm=ctl&LB_CTL_PAD;                                 // the padding mode
  int e[MB_TILES];
 #pragma unroll
- for(int i=0;i<MB_TILES;++i){int f=base+t+MB_TPB*i;e[i]=(f<n&&f>=first)?pad_expert(f,first,ep_rank):lr_sanitize(raw[i]);}
+ for(int i=0;i<MB_TILES;++i){int f=base+t+MB_TPB*i;
+  e[i]=(f<n&&f>=first)?(CTL?lb_ctl_pad_expert(f,first,ep_rank,raw[i],pm):pad_expert(f,first,ep_rank)):lr_sanitize(raw[i]);}
  int rep=0;
 #pragma unroll
  for(int k=0;k<2;++k){
@@ -490,8 +522,9 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mb_k(const int* __restrict__ ids,i
  for(int i=1;i<MB_TILES;++i)if(q==i)e_own=e[i];
  const int f_own=base+q*MB_TPB+t;
  int replicas=__syncthreads_or(rep);                          // barrier A: the tables, the zeroed counts
- if(!replicas){                                               // FAST PATH: as C's kernel
-  int slot=lr_slot(e_own,0,b,ep_rank,counts,starts,slots);
+ const bool ident=CTL&&(ctl&LB_CTL_IDENTITY)!=0;              // identity: home slots, block-uniform
+ if(!replicas||ident){                                        // FAST PATH: as C's kernel
+  int slot=ident?lb_home_slot(e_own):lr_slot(e_own,0,b,ep_rank,counts,starts,slots);
   if(f_own<n)out[f_own]=(OutT)slot;
   return;
  }
@@ -521,11 +554,12 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mb_k(const int* __restrict__ ids,i
 }
 
 // route_b_stage: l3b_mb_k into MegaMoE's staging of the selected bucket; ceil(total / MB_TPB) blocks.
-template<typename OutT>
+// CTL as in l3b_mb_k; a dropped padding element stores the sentinel slot and weight 0.
+template<typename OutT,bool CTL>
 __global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(const int* __restrict__ ids,int n,int ep_rank,
   const int* __restrict__ counts_g,const int* __restrict__ starts_g,const int* __restrict__ slots_g,
   const int* __restrict__ cumw_g,const int* __restrict__ wmode_g,OutT* __restrict__ out,int rows_ref,const int* __restrict__ valid_rows,int bucket_n,int ld,
-  const float* __restrict__ w_in,float* __restrict__ w_out){
+  const float* __restrict__ w_in,float* __restrict__ w_out,const int* __restrict__ ctl_g){
  __shared__ int counts[LR_E];
  __shared__ int starts[LR_E];
  __shared__ int slots[LR_SLOTS];
@@ -540,6 +574,7 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(const int* __restrict__ ids,
   return;
  }
  int vr=(valid_rows!=nullptr)?*valid_rows:0;                  // LOAD: every global word, issued before the first use
+ const int ctl=CTL?*ctl_g:0;                                  // the control word: block-uniform
  int raw[MB_TILES];
 #pragma unroll
  for(int i=0;i<MB_TILES;++i){int f=base+t+MB_TPB*i;raw[i]=(f<n)?ids[f]:LR_E;}
@@ -552,9 +587,11 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(const int* __restrict__ ids,
  }
  int wmode=*wmode_g;                                          // block-uniform: one word per layer
  int first=(valid_rows!=nullptr)?lb_pad_first(vr,n/PAD_K,rows_ref):n;
+ const int pm=ctl&LB_CTL_PAD;                                 // the padding mode
  int e[MB_TILES];
 #pragma unroll
- for(int i=0;i<MB_TILES;++i){int f=base+t+MB_TPB*i;e[i]=(f<n&&f>=first)?pad_expert(f,first,ep_rank):lr_sanitize(raw[i]);}
+ for(int i=0;i<MB_TILES;++i){int f=base+t+MB_TPB*i;
+  e[i]=(f<n&&f>=first)?(CTL?lb_ctl_pad_expert(f,first,ep_rank,raw[i],pm):pad_expert(f,first,ep_rank)):lr_sanitize(raw[i]);}
  int rep=0;
 #pragma unroll
  for(int k=0;k<2;++k){
@@ -567,10 +604,13 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(const int* __restrict__ ids,
 #pragma unroll
  for(int i=1;i<MB_TILES;++i)if(q==i)e_own=e[i];
  const int f_own=base+q*MB_TPB+t;
+ const bool drop_own=CTL&&pm==LB_PAD_DROP&&f_own<n&&f_own>=first;   // a dropped padding element: weight 0
  int replicas=__syncthreads_or(rep);                          // barrier A: the tables, the zeroed counts
- if(!replicas){                                               // FAST PATH: as C's kernel
-  int slot=lr_slot(e_own,0,b,ep_rank,counts,starts,slots);
-  lb_stage_store<OutT>(f_own,n,bucket_n,ld,slot,w_in,out,w_out);
+ const bool ident=CTL&&(ctl&LB_CTL_IDENTITY)!=0;              // identity: home slots, block-uniform
+ if(!replicas||ident){                                        // FAST PATH: as C's kernel
+  int slot=ident?lb_home_slot(e_own):lr_slot(e_own,0,b,ep_rank,counts,starts,slots);
+  if(CTL)lb_ctl_stage_store<OutT>(f_own,n,bucket_n,ld,slot,w_in,out,w_out,drop_own);
+  else lb_stage_store<OutT>(f_own,n,bucket_n,ld,slot,w_in,out,w_out);
   return;
  }
  int a_own=LR_E,r_own=0;
@@ -595,25 +635,33 @@ __global__ void __launch_bounds__(MB_TPB) l3b_mbs_k(const int* __restrict__ ids,
   total=tot[a_own];
  }
  int slot=lb_slot(wmode,e_own,a_own,ordinal,total,b,ep_rank,counts,starts,slots,cumw);
- lb_stage_store<OutT>(f_own,n,bucket_n,ld,slot,w_in,out,w_out);
+ if(CTL)lb_ctl_stage_store<OutT>(f_own,n,bucket_n,ld,slot,w_in,out,w_out,drop_own);
+ else lb_stage_store<OutT>(f_own,n,bucket_n,ld,slot,w_in,out,w_out);
 }
 } // namespace
 
 // One route launch of l3b_mb_k into the caller's buffer `out` (int32 | int64, as many elements as ids, on the current device), current
 // stream, capturable (every pointer is fixed at capture time).  pad: the padding word valid_rows applies with rows_ref of the captured
 // forward (entry route_pad's semantics), else none (entry route's: rows_ref unused).
+// ctl: the control word's device address (the CTL instantiation) or nullptr (the shipped one).
 template<typename OutT>
 static void launch_b(torch::Tensor ids,int ep_rank,const int* cg,const int* sg,const int* slg,torch::Tensor cumw,torch::Tensor wmode,
-  int rows_ref,const int* vr,OutT* out,int n){
+  int rows_ref,const int* vr,OutT* out,int n,const int* ctl){
  auto stream=at::cuda::getCurrentCUDAStream();
- l3b_mb_k<OutT><<<(n+MB_TPB-1)/MB_TPB,MB_TPB,0,stream>>>(ids.data_ptr<int>(),n,ep_rank,cg,sg,slg,cumw.data_ptr<int>(),
-  wmode.data_ptr<int>(),out,rows_ref,vr);
+ if(ctl!=nullptr)
+  l3b_mb_k<OutT,true><<<(n+MB_TPB-1)/MB_TPB,MB_TPB,0,stream>>>(ids.data_ptr<int>(),n,ep_rank,cg,sg,slg,cumw.data_ptr<int>(),
+   wmode.data_ptr<int>(),out,rows_ref,vr,ctl);
+ else
+  l3b_mb_k<OutT,false><<<(n+MB_TPB-1)/MB_TPB,MB_TPB,0,stream>>>(ids.data_ptr<int>(),n,ep_rank,cg,sg,slg,cumw.data_ptr<int>(),
+   wmode.data_ptr<int>(),out,rows_ref,vr,nullptr);
  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ctl / use_ctl: the control word (int32 [1] on the current device) and whether the launch reads it.
 void route_b_cuda(torch::Tensor ids,int64_t ep_rank,int64_t counts_addr,int64_t starts_addr,int64_t slots_addr,torch::Tensor cumw,
-  torch::Tensor wmode,int64_t rows_ref,torch::Tensor valid_rows,bool pad,torch::Tensor out){
+  torch::Tensor wmode,int64_t rows_ref,torch::Tensor valid_rows,bool pad,torch::Tensor out,torch::Tensor ctl,bool use_ctl){
  ck(ids,torch::kInt32);ck(cumw,torch::kInt32);ck(wmode,torch::kInt32);ck(valid_rows,torch::kInt32);
+ if(use_ctl){ck(ctl,torch::kInt32);TORCH_CHECK(ctl.numel()==1,"ctl is a single int32 word");}
  TORCH_CHECK(out.is_cuda()&&out.is_contiguous()&&out.get_device()==c10::cuda::current_device()&&
              (out.scalar_type()==torch::kInt32||out.scalar_type()==torch::kInt64),"out: a current-device contiguous int32 / int64 tensor");
  TORCH_CHECK(ids.dim()==2&&ids.size(1)==K&&ids.size(0)>=0&&ids.size(0)<=MAX_ROWS,"ids must be int32 [rows<=65536, 6]");
@@ -630,10 +678,11 @@ void route_b_cuda(torch::Tensor ids,int64_t ep_rank,int64_t counts_addr,int64_t 
  const int* slg=reinterpret_cast<const int*>(slots_addr);
  const int* vr=pad?valid_rows.data_ptr<int>():nullptr;
  int rr=pad?(int)rows_ref:(int)ids.size(0);
+ const int* cw=use_ctl?ctl.data_ptr<int>():nullptr;
  if(out.scalar_type()==torch::kInt64)
-  launch_b<int64_t>(ids,(int)ep_rank,cg,sg,slg,cumw,wmode,rr,vr,out.data_ptr<int64_t>(),(int)n);
+  launch_b<int64_t>(ids,(int)ep_rank,cg,sg,slg,cumw,wmode,rr,vr,out.data_ptr<int64_t>(),(int)n,cw);
  else
-  launch_b<int>(ids,(int)ep_rank,cg,sg,slg,cumw,wmode,rr,vr,out.data_ptr<int>(),(int)n);
+  launch_b<int>(ids,(int)ep_rank,cg,sg,slg,cumw,wmode,rr,vr,out.data_ptr<int>(),(int)n,cw);
 }
 
 // The stage entry: l3b_mbs_k into the bucket's staging, current stream, capturable.  idx_out: MegaMoE's
@@ -641,16 +690,23 @@ void route_b_cuda(torch::Tensor ids,int64_t ep_rank,int64_t counts_addr,int64_t 
 // topk_weights rows (fp32 [bucket, >= 6], unit column stride, row stride ld = w_out.stride(0)).  pad / rows_ref / valid_rows as route_b.
 template<typename OutT>
 static void launch_stage(torch::Tensor ids,int ep_rank,const int* cg,const int* sg,const int* slg,torch::Tensor cumw,torch::Tensor wmode,
-  int rows_ref,const int* vr,OutT* out,int n,int total,int ld,const float* w_in,float* w_out){
+  int rows_ref,const int* vr,OutT* out,int n,int total,int ld,const float* w_in,float* w_out,const int* ctl){
  auto stream=at::cuda::getCurrentCUDAStream();
- l3b_mbs_k<OutT><<<(total+MB_TPB-1)/MB_TPB,MB_TPB,0,stream>>>(n>0?ids.data_ptr<int>():nullptr,n,ep_rank,cg,sg,slg,cumw.data_ptr<int>(),
-  wmode.data_ptr<int>(),out,rows_ref,vr,total,ld,w_in,w_out);
+ if(ctl!=nullptr)
+  l3b_mbs_k<OutT,true><<<(total+MB_TPB-1)/MB_TPB,MB_TPB,0,stream>>>(n>0?ids.data_ptr<int>():nullptr,n,ep_rank,cg,sg,slg,
+   cumw.data_ptr<int>(),wmode.data_ptr<int>(),out,rows_ref,vr,total,ld,w_in,w_out,ctl);
+ else
+  l3b_mbs_k<OutT,false><<<(total+MB_TPB-1)/MB_TPB,MB_TPB,0,stream>>>(n>0?ids.data_ptr<int>():nullptr,n,ep_rank,cg,sg,slg,
+   cumw.data_ptr<int>(),wmode.data_ptr<int>(),out,rows_ref,vr,total,ld,w_in,w_out,nullptr);
  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ctl / use_ctl as route_b_cuda.
 void route_b_stage_cuda(torch::Tensor ids,int64_t ep_rank,int64_t counts_addr,int64_t starts_addr,int64_t slots_addr,torch::Tensor cumw,
-  torch::Tensor wmode,int64_t rows_ref,torch::Tensor valid_rows,bool pad,torch::Tensor idx_out,torch::Tensor w_in,torch::Tensor w_out){
+  torch::Tensor wmode,int64_t rows_ref,torch::Tensor valid_rows,bool pad,torch::Tensor idx_out,torch::Tensor w_in,torch::Tensor w_out,
+  torch::Tensor ctl,bool use_ctl){
  ck(ids,torch::kInt32);ck(cumw,torch::kInt32);ck(wmode,torch::kInt32);ck(valid_rows,torch::kInt32);ck(w_in,torch::kFloat);
+ if(use_ctl){ck(ctl,torch::kInt32);TORCH_CHECK(ctl.numel()==1,"ctl is a single int32 word");}
  TORCH_CHECK(ids.dim()==2&&ids.size(1)==K&&ids.size(0)>=0&&ids.size(0)<=MAX_ROWS,"ids must be int32 [rows<=65536, 6]");
  TORCH_CHECK(idx_out.is_cuda()&&idx_out.is_contiguous()&&idx_out.get_device()==c10::cuda::current_device()&&
              (idx_out.scalar_type()==torch::kInt64||idx_out.scalar_type()==torch::kInt32)&&idx_out.dim()==2&&idx_out.size(1)==K&&
@@ -672,12 +728,13 @@ void route_b_stage_cuda(torch::Tensor ids,int64_t ep_rank,int64_t counts_addr,in
  const int* vr=pad?valid_rows.data_ptr<int>():nullptr;
  int rr=pad?(int)rows_ref:(int)ids.size(0);
  const float* wi=n>0?w_in.data_ptr<float>():nullptr;
+ const int* cw=use_ctl?ctl.data_ptr<int>():nullptr;
  if(idx_out.scalar_type()==torch::kInt64)
   launch_stage<int64_t>(ids,(int)ep_rank,cg,sg,slg,cumw,wmode,rr,vr,idx_out.data_ptr<int64_t>(),(int)n,(int)total,(int)w_out.stride(0),wi,
-                        w_out.data_ptr<float>());
+                        w_out.data_ptr<float>(),cw);
  else
   launch_stage<int>(ids,(int)ep_rank,cg,sg,slg,cumw,wmode,rr,vr,idx_out.data_ptr<int>(),(int)n,(int)total,(int)w_out.stride(0),wi,
-                    w_out.data_ptr<float>());
+                    w_out.data_ptr<float>(),cw);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){
@@ -686,5 +743,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){
  m.attr("EXPERTS")=LR_E;m.attr("SLOTS")=LR_SLOTS;m.attr("TOP_K")=K;m.attr("BLOCK")=LR_BLOCK;m.attr("CHUNK")=LR_CHUNK;
  m.attr("MAX_ROWS")=MAX_ROWS;m.attr("RANKS")=GENEPLB_RANKS;
  m.attr("PAD_K")=PAD_K;m.attr("PAD_PHASE")=PAD_PHASE;m.attr("MB_TPB")=MB_TPB;m.attr("STAGE")=1;
+ m.attr("CTL")=1;m.attr("LB_PAD_DROP")=LB_PAD_DROP;m.attr("LB_PAD_STOCK")=LB_PAD_STOCK;m.attr("LB_CTL_IDENTITY")=LB_CTL_IDENTITY;
  m.attr("WR_PHI_G")=(int64_t)wroute::WR_PHI_G;m.attr("WR_PHI_E")=(int64_t)wroute::WR_PHI_E;m.attr("WR_GROUP_STRIDE")=wroute::WR_GROUP_STRIDE;
 }

@@ -10,6 +10,7 @@ shares come from the compiled solvers (C: rows objective, B: cost model B); the 
 rule, gain per step x remaining steps > the measured copy time of one layer.
 """
 
+import hashlib
 import heapq
 import math
 import struct
@@ -168,6 +169,31 @@ def tables(layout: list, weights, experts: int):
     return count, start, slots, shares.cumw_from_weights(weights, layout, (count, start, slots))
 
 
+def _ctl_admit(ctl: dict, layer, plan: dict, gain_ms: float, hyst_next: dict, diag: dict) -> bool:
+    """The admission tests after the shipped copy-basis test: the margin (gain per layer-step >
+    gate_margin_us), then the hysteresis (the same plan digest passes gate_hyst consecutive renewals; ctl['hyst'] holds the
+    previous renewal's streaks, hyst_next receives this renewal's; an admitted layer's streak restarts)."""
+    diag["n_copy"] += 1
+    margin = float(ctl.get("gate_margin_us") or 0.0)
+    if margin > 0.0 and not gain_ms * 1e3 > margin:
+        diag["n_margin"] += 1
+        return False
+    need = int(ctl.get("gate_hyst") or 1)
+    if need <= 1:
+        return True
+    key = hashlib.blake2b(
+        repr(sorted((int(e), tuple(int(r) for r in rs)) for e, rs in plan.items())).encode(),
+        digest_size=8,
+    ).hexdigest()
+    last = (ctl.get("hyst") or {}).get(layer)
+    wins = last[1] + 1 if last is not None and last[0] == key else 1
+    if wins >= need:
+        return True
+    hyst_next[layer] = (key, wins)
+    diag["n_hyst"] += 1
+    return False
+
+
 def decide(req: dict) -> dict:
     """One renewal on every rank: shares of every layer's current layout and the layers whose new replicas pay.
 
@@ -186,6 +212,14 @@ def decide(req: dict) -> dict:
     E, n_rem = geo.experts, req["n_rem"]
     c_gpu = req["c_gpu_ms"] or 0.0
     frozen = set(req.get("frozen", ()))
+    ctl = req.get("ctl")  # gate overrides and diagnostics; absent: the shipped gate
+    if ctl is not None:
+        home = geo.home_layout()
+        w_home = costmodel.even_split(home, E)
+        hyst_next = {}
+        diag = dict(
+            j_cur=0.0, cur_id=0.0, cur_new=0.0, adm=0.0, n_eval=0, n_copy=0, n_margin=0, n_hyst=0
+        )
     out_tables, cands, plans = {}, {}, {}
     for layer in sorted(req["totals"]):
         totals, scale = req["totals"][layer], req["scales"][layer]
@@ -193,8 +227,14 @@ def decide(req: dict) -> dict:
         cur = req["layouts"][layer]
         lmode = req["mode"] if req["b_layers"].get(layer, False) else "C"
         model = req["gate_model"] if lmode == "B" else GATE_MODEL_T
+        if ctl is not None and lmode == "B" and ctl.get("gate_tau") is not None:
+            model = dict(model, tau=float(ctl["gate_tau"]))  # the gate's LSE tau (0: hard max); the solver keeps its own
         w_cur = solve_weights(lmode, totals, scale, cur, geo, req["b_params"])
         out_tables[layer] = tables(cur, w_cur, E)
+        if ctl is not None:  # the gate model's J of the current layout and its excess over identity (home slots only)
+            j_cur = layer_us(model, cbar, cur, w_cur, geo)
+            diag["j_cur"] += j_cur
+            diag["cur_id"] += j_cur - layer_us(model, cbar, home, w_home, geo)
         if not req["install"] or n_rem is None or sum(totals) <= 0.0 or layer in frozen:
             continue
         plan = fixedhome_targets(totals, geo, req["total_active"], req["cap"])
@@ -205,7 +245,12 @@ def decide(req: dict) -> dict:
         gain_ms = (
             layer_us(model, cbar, cur, w_cur, geo) - layer_us(model, cbar, new, w_new, geo)
         ) / 1e3
+        if ctl is not None:
+            diag["n_eval"] += 1
+            diag["cur_new"] += gain_ms * 1e3
         if gain_ms * n_rem > c_gpu:
+            if ctl is not None and not _ctl_admit(ctl, layer, plan, gain_ms, hyst_next, diag):
+                continue
             cands[layer] = gain_ms
             plans[layer] = (new, copies, w_new)
     order = sorted(cands, key=lambda li: (-cands[li], li))[: req["max_layers"]]
@@ -218,12 +263,16 @@ def decide(req: dict) -> dict:
         )
         for li in order
     ]
-    return dict(
+    out = dict(
         tables=out_tables,
         installs=installs,
         gains={li: cands[li] for li in order},
         candidates=len(cands),
     )
+    if ctl is not None:
+        diag["adm"] = 1e3 * sum(cands[li] for li in order)
+        out.update(diag=diag, hyst=hyst_next)
+    return out
 
 
 def renewal_interval(floor: int, fixed_ms, slope_ms, growth, n_rem) -> int:

@@ -57,6 +57,94 @@ LIVE_COOLDOWN = 32
 # cost +1.7..6 % mean GEN step against no balancer, while a run that installed nothing matched it.
 # TLLM_GENEPLB_LIVE_MIN_T overrides the floor (0: off).
 LIVE_MIN_T = int(os.environ.get("TLLM_GENEPLB_LIVE_MIN_T", "32"))
+# ---------------------------------------------------------------------------------------------------------------------------
+# RUN-TIME CONTROL SWITCHES (policy and diagnostics). Without TLLM_GENEPLB_CTL_FILE and TLLM_GENEPLB_FORCE_LIVE
+# every path below is the shipped one (route launches without the control word, the shipped gate, gathered tail and log line).
+#   TLLM_GENEPLB_FORCE_LIVE=1: every renewal is priced as live serving from the first one (a fill / lockstep gen-only run sees
+#     no arrival after the first renewal, so the shipped rule stays on the fixed-batch path and never applies the low-T guard).
+#   TLLM_GENEPLB_CTL_FILE=<path>: every rank re-reads the file when it packs its renewal statistics (on a change of its mtime /
+#     size / inode: write it atomically, tmp + rename); the codes ride in the gathered tail and every rank takes the MAX over
+#     ranks, so every rank makes the same decision (a file change mid-gather cannot split the plan digest). Tokens 'key=value'
+#     (CTL_SPEC; unknown keys and malformed values are ignored, '#' starts a comment, no file = every default = shipped). The
+#     per-replay fields (pad, identity) reach the captured route kernels through the device word t_ctl, written on the forward
+#     stream between two replays together with the renewal's tables; each rank mirrors its applied fields into
+#     <CTL_FILE>.rank<r> on a change, and rank 0's renewal line carries them with the real / padded T and the gate's sums.
+#   TLLM_GENEPLB_NANPROBE=1 (with the control file): a captured count of non-finite router weights over every row (padding
+#     rows included) of every staged layer, summed over ranks in the renewal line and the status files.
+FORCE_LIVE = os.environ.get("TLLM_GENEPLB_FORCE_LIVE", "0") == "1"
+CTL_FILE = os.environ.get("TLLM_GENEPLB_CTL_FILE", "")
+NANPROBE = bool(CTL_FILE) and os.environ.get("TLLM_GENEPLB_NANPROBE", "0") == "1"
+# (field, choices text -> code | number type, default code). Code -1 is the shipped value: min_t LIVE_MIN_T, gate_tau the prior
+# row's tau ('prior'), gate_horizon 'fixed' (the shipped N_rem: max(N_rem, LIVE_HORIZON) once live).
+CTL_SPEC = (
+    ("install", {"normal": 0, "freeze": 1}, 0),  # freeze: shares only, no new replica
+    ("min_t", int, -1),  # the low-T guard's floor (LIVE_MIN_T override)
+    ("guard_t", {"real": 0, "padded": 1}, 0),  # the T the guard tests: real rows, or the padded rows MegaMoE runs
+    ("pad", {"spread": 0, "drop": 1, "stock": 2}, 0),  # padding rows: shipped spread | sentinel + weight 0 | own ids
+    ("identity", {"0": 0, "1": 1}, 0),  # every id to its home slot (fast path), no installs, held replicas unused
+    ("gate_tau", float, -1),  # the gate's LSE tau in us (0: the hard max); 'prior': the prior row's
+    ("gate_margin_us", float, 0),  # gain per layer-step required on top of the copy-basis test
+    ("gate_hyst", int, 1),  # consecutive renewals a layer's plan (same digest) must pass before it installs
+    ("gate_horizon", int, -1),  # the payback horizon in replays; 'fixed': the shipped one
+    ("copy", {"nccl": 0, "ce": 1}, 0),  # reserved for the copy prototype (this build copies with NCCL either way)
+)
+CTL_DEFAULT = tuple(float(d) for _, _, d in CTL_SPEC)
+CTL_PAD_WORD = {"spread": 0, "drop": 1, "stock": 2}  # l3b_route_kernels.cu LB_PAD_* (control word bits 0-1)
+CTL_IDENTITY_BIT = 4  # l3b_route_kernels.cu LB_CTL_IDENTITY
+
+
+def parse_ctl(text: str):
+    """(codes in CTL_SPEC order, the ignored tokens of known keys) of a control file's text."""
+    vals, bad = list(CTL_DEFAULT), []
+    index = {name: i for i, (name, _, _) in enumerate(CTL_SPEC)}
+    for line in text.splitlines():
+        for tok in line.split("#", 1)[0].split():
+            key, sep, value = tok.partition("=")
+            i = index.get(key) if sep else None
+            if i is None:
+                continue  # not 'key=value' of a known key: ignored
+            kind = CTL_SPEC[i][1]
+            try:
+                if isinstance(kind, dict):
+                    code = float(kind[value])
+                elif (key, value) in (("gate_horizon", "fixed"), ("gate_tau", "prior"), ("min_t", "default")):
+                    code = -1.0
+                else:
+                    code = float(kind(value))
+                    if not (code >= (1.0 if key in ("gate_hyst", "gate_horizon") else 0.0) and code < 1e15):
+                        raise ValueError(value)
+            except (KeyError, ValueError):
+                bad.append(tok)
+                continue
+            vals[i] = code
+    return tuple(vals), bad
+
+
+def ctl_fields(codes) -> dict:
+    """The control fields of (the MAX over ranks of) a code vector, with the shipped values resolved."""
+    c = {name: float(v) for (name, _, _), v in zip(CTL_SPEC, codes)}
+    return dict(
+        install="freeze" if c["install"] >= 1 else "normal",
+        min_t=LIVE_MIN_T if c["min_t"] < 0 else int(c["min_t"]),
+        guard_t="padded" if c["guard_t"] >= 1 else "real",
+        pad=("spread", "drop", "stock")[min(2, max(0, int(c["pad"])))],
+        identity=1 if c["identity"] >= 1 else 0,
+        gate_tau=None if c["gate_tau"] < 0 else c["gate_tau"],
+        gate_margin_us=max(0.0, c["gate_margin_us"]),
+        gate_hyst=max(1, int(c["gate_hyst"])),
+        gate_horizon=None if c["gate_horizon"] < 1 else int(c["gate_horizon"]),
+        copy="ce" if c["copy"] >= 1 else "nccl",
+    )
+
+
+def ctl_text(f: dict) -> str:
+    """The canonical control line of the fields (a control file holding it parses back to the same fields)."""
+    return (
+        f"install={f['install']} min_t={f['min_t']} guard_t={f['guard_t']} pad={f['pad']} identity={f['identity']} "
+        f"gate_tau={'prior' if f['gate_tau'] is None else repr(f['gate_tau'])} gate_margin_us={f['gate_margin_us']!r} "
+        f"gate_hyst={f['gate_hyst']} gate_horizon={'fixed' if f['gate_horizon'] is None else f['gate_horizon']} "
+        f"copy={f['copy']}"
+    )
 # After the final warmup: bytes exchanged with every peer to connect it, and the layers the startup copy probe times
 # (the shipped startup probe: the first gate prices installs with a measured copy cost).
 CONNECT_BYTES = 4 << 20
@@ -209,6 +297,9 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.valid_rows = torch.full((1,), native.VALID_ALL, dtype=torch.int32, device=dev)
         self.enable = torch.zeros(1, dtype=torch.int32, device=dev)
         self._valid_host, self._enable_host = native.VALID_ALL, 0
+        # the control word of the CTL route launches (cost model B's kernel only) and the NaN probe's counter.
+        self.t_ctl = torch.zeros(1, dtype=torch.int32, device=dev) if CTL_FILE and self.mode == "B" else None
+        self._nan_acc = torch.zeros(1, dtype=torch.int32, device=dev) if NANPROBE else None
         self.stats = native.StatsKernel(L, geo.experts, geo.ranks, dev, geo.top_k, slots=geo.slots)
         self.kernel = native.RouteKernel(
             self.mode, geo.experts, geo.slots, geo.ranks, self.ep_rank, dev, geo.top_k
@@ -321,7 +412,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.connected = False
         # No replica held and the last gate admitted none (set by each renewal).
         self.dormant = False
-        self.live = False  # requests arrived after the first renewal on some rank (from the gathered counts)
+        self.live = FORCE_LIVE  # requests arrived after the first renewal on some rank (from the gathered counts)
         self.arrivals = 0  # this rank's requests that started decoding since the last gather
         self.decisions = 0  # renewal decisions requested (the same sequence on every rank)
         self.installed_at = {}  # layer -> the decision that installed it
@@ -330,6 +421,14 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         self.rem_sum, self.rem_count = 0.0, 0
         self.draft_len = 0
         self.lifetime = None  # EWMA of finished requests' output tokens (None until one finishes)
+        # the control channel: the codes read last and the file's change key, the applied status (None before the
+        # first decision), the device word / drop flag in force and due at the next table write, the window's padded rows, the
+        # gate's hysteresis state (layer -> (plan digest, consecutive passes)), the NaN probe's host snapshot.
+        self._ctl_codes, self._ctl_key, self._ctl_applied = CTL_DEFAULT, None, None
+        self._ctl_word, self._ctl_word_next, self._drop_words, self._drop_next = 0, 0, False, False
+        self.window_prows = 0
+        self._hyst = {}
+        self._snap_nan = torch.zeros(1, dtype=torch.int32, pin_memory=prefer_pinned()) if NANPROBE else None
 
     def begin_step(self, scheduled_requests, draft_len: int, graph: bool, is_dummy: bool) -> None:
         """Before a forward: the valid-rows / enable words, the writes due now, the window, the budgets."""
@@ -348,12 +447,19 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 self.stats.reset()  # the window's EMA starts from zero, stream-ordered before this replay
                 n = OPENING_WINDOW if self.renewals == 0 else WINDOW
                 self.window_end, self.window_open, self.window_rows = self.replays + n, True, 0
+                self.window_prows = 0
             if self.window_open:
                 self.window_rows = max(self.window_rows, rows)
+                if CTL_FILE:  # the rows MegaMoE runs: graph padding and attention-DP dummies included
+                    self.window_prows = max(
+                        self.window_prows,
+                        len(scheduled_requests.generation_requests) * (1 + self.draft_len),
+                    )
         # The statistics kernel counts only a window's replays; a dormant balancer routes like main between its
         # windows (no padding spread), so its words stay put and no step writes them.
+        # pad=drop: the real rows on every counted replay, dormant ones included (padding always dropped).
         window = counted and self.window_open
-        spread = window or (counted and not self.dormant)
+        spread = window or (counted and (not self.dormant or self._drop_words))
         self._set_words(rows if spread else native.VALID_ALL, 1 if window else 0)
         self._advance()
         self._copy_due()
@@ -370,6 +476,8 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             self.window_open = False
             self.snap_load.copy_(self.stats.load, non_blocking=True)
             self.snap_steps.copy_(self.stats.steps, non_blocking=True)
+            if self._snap_nan is not None:
+                self._snap_nan.copy_(self._nan_acc, non_blocking=True)
             self.snap_event = torch.cuda.Event()
             self.snap_event.record()
 
@@ -434,10 +542,12 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         if staged:
             return ids  # expert ids: the backend's run_moe routes them into its staging (_stage)
         return self.kernel(
-            ids, self._tables(layer.index), self._rows_ref, self.valid_rows, self.out_dtype
+            ids, self._tables(layer.index), self._rows_ref, self.valid_rows, self.out_dtype, ctl=self.t_ctl
         )
 
     def _stage(self, layer: GenEplbLayer, ids, weights, idx_out, w_out) -> None:
+        if self._nan_acc is not None and weights.numel():  # non-finite router weights, every row (capturable)
+            self._nan_acc += (~torch.isfinite(weights)).sum(dtype=torch.int32)
         self.kernel.stage(
             ids,
             self._tables(layer.index),
@@ -446,6 +556,7 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             idx_out,
             weights,
             w_out,
+            ctl=self.t_ctl,
         )
 
     def _tables(self, li: int):
@@ -499,12 +610,18 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
 
     def _start_gather(self) -> None:
         acc = self.accept or (0.0, 0.0)
+        extra = []
+        if CTL_FILE:  # the control codes, the window's padded rows and the NaN count ride in the tail
+            self._ctl_read()
+            nan = float(self._snap_nan[0]) if self._snap_nan is not None else 0.0
+            extra = [*self._ctl_codes, float(self.window_prows), nan]
         local = np.concatenate(
             [
                 self.snap_load.numpy().astype(np.float64).ravel(),
                 self.snap_steps.numpy().astype(np.float64),
                 np.array(
-                    [self.rem_sum, self.rem_count, acc[0], acc[1], self.window_rows, self.arrivals],
+                    [self.rem_sum, self.rem_count, acc[0], acc[1], self.window_rows, self.arrivals]
+                    + extra,
                     dtype=np.float64,
                 ),
             ]
@@ -533,6 +650,12 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         tail = rows[:, L * E + L :]
         rem_sum, count, app, rc = (float(tail[:, i].sum()) for i in range(4))
         tokens = int(tail[:, 4].max())  # T: the largest real decode rows of one replay on any rank
+        ctl = None
+        if CTL_FILE:  # the MAX over ranks of every rank's codes: the same fields on every rank
+            k = len(CTL_SPEC)
+            ctl = ctl_fields(tail[:, 6 : 6 + k].max(axis=0))
+            ctl["T_pad"] = int(tail[:, 6 + k].max())  # padded T: the largest padded rows of one replay on any rank
+            ctl["nan"] = int(tail[:, 7 + k].sum())  # non-finite router weights so far, summed over ranks
         if tokens == 0 or not totals.any():
             # An idle window (no real decode rows on any rank): nothing to renew.
             self._next_window()
@@ -555,6 +678,17 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         b_params = costmodel.prior_params(max(1, tokens)) if self.mode == "B" else None
         install = not (self.live and tokens < LIVE_MIN_T)
         self._last = dict(n_rem=n_rem, tokens=tokens, install=install)
+        if ctl is not None:  # the guard on the real or padded T against min_t, freeze / identity, the horizon
+            t_guard = ctl["T_pad"] if ctl["guard_t"] == "padded" else tokens
+            install = not (self.live and t_guard < ctl["min_t"])
+            why = "" if install else f"{ctl['guard_t']} T {t_guard} < min_t {ctl['min_t']}"
+            if ctl["identity"] or ctl["install"] == "freeze":
+                install, why = False, ("identity" if ctl["identity"] else "freeze")
+            if ctl["gate_horizon"] is not None and n_rem is not None:
+                n_rem = float(ctl["gate_horizon"])
+            self._last = dict(
+                n_rem=n_rem, tokens=tokens, install=install, ctl=ctl, t_guard=t_guard, why=why
+            )
         self.worker.request(
             "decide",
             dict(
@@ -580,6 +714,18 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
                 cap=geo.local_slots - geo.homes,
                 install=install,
                 max_layers=L,
+                **(
+                    {}
+                    if ctl is None
+                    else dict(
+                        ctl=dict(
+                            gate_tau=ctl["gate_tau"],
+                            gate_margin_us=ctl["gate_margin_us"],
+                            gate_hyst=ctl["gate_hyst"],
+                            hyst=self._hyst,
+                        )
+                    )
+                ),
             ),
         )
         self.decision = True
@@ -615,12 +761,14 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
             reply["installs"],
             chunk,
         )
+        note = self._ctl_apply(reply) if self._last.get("ctl") is not None else ""
         if self.ep_rank == 0:
             logger.info(
                 f"GenEPLB renewal {self.renewals} @replay {self.replays}: mode {self.mode}, T {self._last['tokens']}"
                 f"{'' if self._last.get('install', True) else ' (below LIVE_MIN_T: shares only)'}, "
                 f"shares {len(reply['tables'])} layers, gate {len(reply['installs'])}/{reply['candidates']} layers, "
                 f"N_rem {self._last['n_rem']}{' (live horizon)' if self.live else ''}, c_gpu_ms {self.c_gpu_ms}"
+                f"{note}"
             )
         self.dormant = not reply["installs"] and not self._holds_replicas()
         self._next_window()
@@ -629,6 +777,74 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         gap = DORMANT_PERIOD if self.dormant else RENEWAL_FLOOR - WINDOW
         self.window_start = max(self.replays + 1, self.window_end + gap)
         self.window_end = None
+
+    # ------------------------------------------------------------------ the control channel
+    def _ctl_read(self) -> None:
+        """Re-read CTL_FILE when its (mtime, size, inode) changed: a missing file is every default, any other error keeps
+        the codes in force. open() + fstat, not a bare stat: on NFS an open revalidates the attributes (close-to-open)."""
+        try:
+            with open(CTL_FILE, "rb") as f:
+                st = os.fstat(f.fileno())
+                key = (st.st_mtime_ns, st.st_size, st.st_ino)
+                if key == self._ctl_key:
+                    return
+                text = f.read().decode("utf-8", "replace")
+        except FileNotFoundError:
+            self._ctl_codes, self._ctl_key = CTL_DEFAULT, None
+            return
+        except OSError:
+            return
+        self._ctl_codes, bad = parse_ctl(text)
+        self._ctl_key = key
+        if bad and self.ep_rank == 0:
+            logger.warning(f"GenEPLB ctl: ignored {bad} in {CTL_FILE}")
+
+    def _ctl_apply(self, reply: dict) -> str:
+        """A decision's control fields take effect: the gate's hysteresis state, the device word and the drop flag (written
+        with the renewal's tables, _write_tables), this rank's status file on a change. -> the renewal line's note."""
+        last = self._last
+        ctl = last["ctl"]
+        self._hyst = reply.get("hyst", {})
+        if self.t_ctl is not None:
+            self._ctl_word_next = CTL_PAD_WORD[ctl["pad"]] | (CTL_IDENTITY_BIT if ctl["identity"] else 0)
+            self._drop_next = ctl["pad"] == "drop"
+        text = ctl_text(ctl)
+        status = f"{text} word={self._ctl_word_next} nan={ctl['nan']}"
+        if status != self._ctl_applied:
+            if self.ep_rank == 0 and not (self._ctl_applied or "").startswith(text + " "):
+                logger.info(
+                    f"GenEPLB ctl @renewal {self.renewals} (decision {self.decisions}, replay {self.replays}): {text}, "
+                    f"device word {self._ctl_word_next}"
+                )
+                if self.t_ctl is None and (ctl["pad"] != "spread" or ctl["identity"]):
+                    logger.warning("GenEPLB ctl: pad / identity need cost model B's route kernel; mode C ignores them")
+                if ctl["copy"] == "ce":
+                    logger.warning("GenEPLB ctl: copy=ce is reserved; this build copies with NCCL")
+            self._ctl_applied = status
+            self._ctl_status(status)
+        d = reply.get("diag") or {}
+        return (
+            f" | ctl {text}; T real {last['tokens']} padded {ctl['T_pad']} guard {ctl['guard_t']} {last['t_guard']}"
+            f"{'' if last['install'] else ' (no install: ' + last['why'] + ')'}; gate us/step: "
+            f"cur-new {d.get('cur_new', 0.0):.2f} admitted {d.get('adm', 0.0):.2f} ({d.get('n_eval', 0)} eval, "
+            f"{d.get('n_copy', 0)} pass copy, {d.get('n_margin', 0)} margin-rej, {d.get('n_hyst', 0)} hyst-wait), "
+            f"cur-id {d.get('cur_id', 0.0):.2f}, J_cur {d.get('j_cur', 0.0):.1f}; word {self._ctl_word_next}; "
+            f"nan {ctl['nan']}"
+        )
+
+    def _ctl_status(self, status: str) -> None:
+        """<CTL_FILE>.rank<r>: the control this rank applies (rewritten on a change: tmp + rename)."""
+        path = f"{CTL_FILE}.rank{self.ep_rank}"
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(
+                    f"rank={self.ep_rank} renewal={self.renewals} decision={self.decisions} replay={self.replays} "
+                    f"forwards={self.forwards} {status}\n"
+                )
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     def _holds_replicas(self) -> bool:
         """Whether any layer has a copy in a spare slot (its layout differs from the home layout)."""
@@ -648,6 +864,10 @@ class GenEplbMoeLoadBalancer(BaseMoeLoadBalancer):
         ):
             dst.copy_(maybe_pin_memory(torch.from_numpy(src)), non_blocking=True)
         self.t_wmode.fill_(1)
+        if self._ctl_word_next != self._ctl_word:  # the control word switches with the renewal's tables
+            self.t_ctl.fill_(self._ctl_word_next)
+            self._ctl_word = self._ctl_word_next
+        self._drop_words = self._drop_next
         self.pending_writes = False
 
     def _copy_due(self) -> None:
